@@ -1,33 +1,73 @@
 use crate::utils::Bit;
 
+#[derive(Debug, Clone, Copy)]
 pub struct TransmitHeader {
-    // Data Not Control 31
+    // Data Not Control flag (bit 31)
+    // Specifies the type of SPI transaction. For TX data chunks, this bit shall be '1'.
+    // 0 = Control command
+    // 1 = Data chunk
     pub dnc: bool,
 
-    // Data chunk sequence 30
+    // Data Chunk Sequence bit (bit 30)
+    // When SEQE is enabled in CONFIG0 register, this acts as an even/odd bit (LSB of transmit data chunk counter).
+    // The SPI host shall toggle this bit for each new transmit data chunk. When the MAC-PHY receives a chunk
+    // with SEQ unchanged from the previous chunk, it assumes a resend and does not accept the current chunk.
+    // When disabled or unsupported, the MAC-PHY ignores this bit and the host should write SEQ = 0.
     pub seq: bool,
 
-    // no receive 29
+    // No Receive flag (bit 29)
+    // Used by the SPI host for flow control to the MAC-PHY. When NORX = 1, the host will ignore the current
+    // receive data chunk payload, and the MAC-PHY will set DV = 0 in the footer of the current receive data chunk.
+    // Any available receive frame data is retained and the MAC-PHY will attempt to resend it on the next data chunk.
+    // When NORX = 0, the host indicates it will receive and process the current receive data chunk payload.
     pub norx: bool,
 
-    // data valid
+    // Data Valid flag (bit 21)
+    // Indicates to the MAC-PHY whether the current transmit data chunk payload contains valid transmit
+    // Ethernet frame data. When DV = 1, the SV and EV flags should be set accordingly to locate frame
+    // data boundaries. It is possible that DV = 1 with both SV = 0 and EV = 0 during long frame transfers,
+    // or SV = 1 and EV = 1 for a complete frame within a single chunk. When DV = 0, the MAC-PHY ignores
+    // the transmit data chunk payload.
     pub dv: bool,
 
-    // start valid 21
+    // Start Valid flag (bit 20)
+    // Indicates whether the transmit data chunk payload contains a valid beginning of an Ethernet frame.
+    // When SV = 1, the SWO field shall be set to locate the beginning of the frame. When SV = 0, the
+    // SPI host shall write SWO and EBO as all zero.
     pub sv: bool,
 
-    // Start word offset, 28..24
+    // Start Word Offset (bits 19-16)
+    // When SV = 1, this field is set to the offset (expressed in 32-bit words) of the first data byte
+    // within the payload of the chunk. The first byte of the Ethernet frame is always the most significant
+    // byte of the 32-bit word, ensuring alignment to a 32-bit boundary. Range: 0 to 15. When SV = 0,
+    // the host shall write this field as zero.
     pub swo: u8,
 
-    // End valid
+    // End Valid flag (bit 14)
+    // Indicates whether the transmit data chunk payload contains the end of an Ethernet frame.
+    // When EV = 1, the EBO field shall be set accordingly to point to the position of the last byte
+    // of the frame within the transmit data chunk payload.
     pub ev: bool,
 
-    // end byte offset
+    // End Byte Offset (bits 13-8)
+    // When EV = 1, this field is set to the offset of the last byte of the Ethernet frame within the
+    // chunk payload. The first byte of the transmit data chunk payload is located at an offset of zero.
+    // When EV = 0, the host shall write this field as zero.
     pub ebo: u8,
 
-    // transmit frame timestamp capture 7..6
+    // Timestamp Capture (bits 7-6)
+    // Used by the SPI host to request the capture of a timestamp when the frame is transmitted onto the network.
+    // This field is only valid when SV = 1 and shall be ignored when SV = 0 or the timestamp feature is not
+    // supported. The host shall set TSC = 00 at all other times.
+    // 00 = Do not capture a timestamp
+    // 01 = Capture timestamp into timestamp capture register A
+    // 10 = Capture timestamp into timestamp capture register B
+    // 11 = Capture timestamp into timestamp capture register C
     pub tsc: u8,
 
+    // Parity bit (bit 0)
+    // Odd parity bit for transmit data header protection. Provides error detection as described in Section 8.5.2.
+    // When a header is received with a parity error, the MAC-PHY handles it as described in Section 7.5.
     pub parity: bool,
 }
 
@@ -144,10 +184,10 @@ impl TransmitHeader {
         header_u32.set_bit(29, self.norx);
         header_u32.set_bit(21, self.dv);
         header_u32.set_bit(20, self.sv);
-        header_u32 |= self.swo as u32 & 0b1111 << 16;
+        header_u32 |= (self.swo as u32 & 0b1111) << 16;
         header_u32.set_bit(14, self.ev);
-        header_u32 |= self.ebo as u32 & 0b111111 << 8;
-        header_u32 |= self.tsc as u32 & 0b11 << 6;
+        header_u32 |= (self.ebo as u32 & 0b111111) << 8;
+        header_u32 |= (self.tsc as u32 & 0b11) << 6;
         header_u32.set_bit(0, self.parity);
         header_u32.to_be_bytes()
     }

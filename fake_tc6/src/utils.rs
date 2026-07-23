@@ -16,7 +16,7 @@ pub trait Bit:
     }
 
     fn get_bit(&self, n: Self) -> bool {
-        (*self & !(Self::from(true) << n)) != Self::from(false)
+        (*self & (Self::from(true) << n)) != Self::from(false)
     }
 }
 impl<T> Bit for T where

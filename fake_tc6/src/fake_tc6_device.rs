@@ -1,12 +1,12 @@
 use crate::{
-    fake_tc6_device::Mode::{Command, ReadingHeader, ReadingWritingBlock},
+    fake_tc6_device::Mode::{Command, ReadingCommandHeader, ReadingHeader, ReadingWritingBlock},
     transmit_header::TransmitHeader,
 };
 use embedded_hal::spi::{self, Operation, SpiDevice};
 use log::{info, trace, warn};
 use std::vec;
 
-const DEFAULT_BLOCK_SIZE: u16 = 64;
+const DEFAULT_BLOCK_SIZE: usize = 64;
 
 // exist because borrow checker
 pub struct FakeTc6SpiDevice {
@@ -31,12 +31,11 @@ impl FakeTc6SpiDevice {
     }
 
     fn helper_write(&mut self, buf: &[u8]) -> Result<(), FakeTc6SpiDeviceError> {
-        for (_i, byte) in buf.iter().enumerate() {
+        for byte in buf.iter() {
             self.device.handle_byte(*byte)?;
-            //TODO add warning if write happens during footer output
-            // if  >= self.device.block_size -4 {
-            //     info!("not reading the MISO footer")
-            // }
+            if self.device.is_sending_footer() {
+                info!("not reading the MISO footer")
+            }
         }
         if !matches!(self.device.mode, ReadingHeader(0)) {
             warn!("Transaction did not end on starting point")
@@ -67,23 +66,23 @@ impl Default for FakeTc6SpiDevice {
 }
 pub struct FakeTc6Device {
     mode: Mode,
-    block_size: u16,
+    block_size: usize,
     // the header the master, eg the mcu, have sent
     mosi_header_raw: [u8; 4],
     transmit_header: TransmitHeader,
     // the footer the mac-phy responds with
     miso_footer: [u8; 4],
 
-    // offset in frame buff that the current block output shuld start att
-    offset: usize,
+    // offset in frame buff that the current block output should start at IN WORDS NOT BYTES
+    offset: isize,
     // buffer of eth frames to be sent on wire
-    transmit_buff: vec::Vec<u8>,
+    transmit_buff: vec::Vec<vec::Vec<u8>>,
     // buffer of received eth frames from wire
     receive_buff: vec::Vec<u8>,
 }
 
 impl FakeTc6Device {
-    pub fn new() -> FakeTc6Device {
+    fn new() -> FakeTc6Device {
         FakeTc6Device {
             mode: ReadingHeader(0),
             block_size: DEFAULT_BLOCK_SIZE,
@@ -96,60 +95,159 @@ impl FakeTc6Device {
         }
     }
 
-    fn handle_byte(&mut self, byte: u8) -> Result<u8, FakeTc6DeviceError> {
-        // todo add function so that state can return index into transaction
-        let i2 = match self.mode {
-            ReadingHeader(i) => i as usize,
-            ReadingWritingBlock(i) => i as usize + 4,
-            Command => todo!(),
-        };
-        let mut out = *self.transmit_buff.get(i2 + self.offset).unwrap_or(&0); // todo, add a seeded random here
-        // handle if buff becomes empty and update end position in MISO header
+    fn is_reading_header(&self) -> bool {
+        matches!(self.mode, ReadingHeader(_))
+    }
 
-        match self.mode {
-            // TODO
-            #[allow(clippy::ifs_same_cond)]
-            ReadingHeader(i) => {
-                trace!("read byte {} of header", i);
-                self.mosi_header_raw[i as usize] = byte;
-                self.mode = ReadingHeader(i + 1);
-                if i == 3
-                /*TODO && header is NOT command*/
-                {
-                    self.mode = ReadingWritingBlock(0);
-                    trace!("header is {:?}", self.mosi_header_raw)
-                } else if false
-                /*TODO && i == 3 and header is command */
-                {
-                    self.mode = Command;
-                }
-            }
-            ReadingWritingBlock(i) => {
-                // if reading header is sending data AND i > (starting_offset << 2) and i < end_offset if exist
-                // push byte
+    fn is_sending_footer(&self) -> bool {
+        matches!(self.mode, ReadingWritingBlock(i) if i >= self.block_size - 4)
+    }
 
-                if i > self.block_size.saturating_sub(4) {
-                    // +1 because zero indexed
-                    out = self.miso_footer[(i - (self.block_size - 4 + 1)) as usize]
-                } else {
-                    out = self
-                        .receive_buff
-                        .get(i as usize + self.offset)
-                        .cloned()
-                        .unwrap_or(0);
-                }
-                if i == self.block_size - 1 {
-                    // header indicates host listend, inc offset so next block contains
-                    if !self.transmit_header.norx {
-                        self.offset += self.block_size as usize;
-                    }
-                    self.mode = ReadingHeader(0)
-                } else {
-                    self.mode = ReadingWritingBlock(i + 1);
-                }
+    fn handle_reading_header(&mut self, byte: u8, i: usize) -> Result<u8, FakeTc6DeviceError> {
+        let i2 = i;
+        let out = *self
+            .receive_buff
+            .get(i2 + self.offset as usize)
+            .unwrap_or(&0);
+
+        trace!("read byte {} of header", i);
+        self.mosi_header_raw[i] = byte;
+        self.mode = ReadingHeader(i + 1);
+        if i == 3 {
+            self.transmit_header = TransmitHeader::from_slice(&self.mosi_header_raw).unwrap();
+
+            trace!(
+                "header is {:?}\n{:?}",
+                self.mosi_header_raw, self.transmit_header
+            );
+            if self.transmit_header.dnc {
+                self.mode = ReadingWritingBlock(0);
+            } else {
+                self.mode = Command(0);
             }
-            Command => todo!(),
         }
+        Ok(out)
+    }
+
+    fn handle_reading_writing_block(
+        &mut self,
+        byte: u8,
+        i: usize,
+    ) -> Result<u8, FakeTc6DeviceError> {
+        // if dv is set and the byte is in the data section, push it to the transmit buffer
+
+        // if no sv and ev is set, the data section is from start of block to end of block
+        // if sv is set and ev is not set, the data section is from swo*4 to end of block
+        // if sv is not set and ev is set, the data section is from start of block to ebo
+        // if ev and sv are set and swo*4 < ebo, the data section is from swo*4 to ebo
+        // if ev and sv are set and swo*4 >= ebo, the data section is from start of block to EBO and SWO to end of block
+        if self.transmit_header.dv {
+            match (
+                self.transmit_header.sv,
+                self.transmit_header.ev,
+                self.transmit_header.swo >= self.transmit_header.ebo,
+            ) {
+                // sv and ev are not set, data section is entire block
+                (false, false, _) => {
+                    // safe to push, we need to had a sv before this can occur, some one need to have pushed an empty vec
+                    self.transmit_buff.last_mut().unwrap().push(byte);
+                }
+                // sv is set and ev is not set, data section is from swo*4 to end of block
+                (true, false, _) => {
+                    if i == self.transmit_header.swo as usize * 4 {
+                        self.transmit_buff.push(vec![]);
+                    }
+                    if i >= self.transmit_header.swo as usize * 4 {
+                        // safe to push, we need to had a sv before this can occur, some one need to have pushed an empty vec
+                        self.transmit_buff.last_mut().unwrap().push(byte);
+                    }
+                }
+                // sv is not set and ev is set, data section is from start of block to ebo
+                (false, true, _) => {
+                    if i <= self.transmit_header.ebo as usize {
+                        // safe to push, we need to had a sv before this can occur, some one need to have pushed an empty vec
+                        self.transmit_buff.last_mut().unwrap().push(byte);
+                    }
+                }
+                // sv and ev are set, data section is from swo*4 to ebo if swo*4 < ebo, else from start of block to ebo and SWO to end of block
+                (true, true, false) => {
+                    if i == self.transmit_header.swo as usize * 4 {
+                        self.transmit_buff.push(vec![]);
+                    }
+                    if i >= self.transmit_header.swo as usize * 4
+                        && i <= self.transmit_header.ebo as usize
+                    {
+                        // safe to push, we need to had a sv before this can occur, some one need to have pushed an empty vec
+                        self.transmit_buff.last_mut().unwrap().push(byte);
+                    }
+                }
+                // sv and ev are set, data section is from swo*4 to ebo if swo*4 < ebo, else from start of block to ebo and SWO to end of block
+                (true, true, true) => {
+                    // NOTE ebo is never equal to SWO*4, as ebo points to the last byte of the frame, and SWO*4 points to the first byte of the frame,
+                    // so if they are equal either the last byte from a frame is the same as the first byte of the next frame which is not possible,
+                    // nor is a 1 byte frame possible.
+
+                    if i == self.transmit_header.swo as usize * 4 {
+                        self.transmit_buff.push(vec![]);
+                    }
+
+                    if i <= self.transmit_header.ebo as usize {
+                        // safe to push, we need to had a sv before this can occur, some one need to have pushed an empty vec
+                        self.transmit_buff.last_mut().unwrap().push(byte);
+                    }
+                    if i >= self.transmit_header.swo as usize * 4 {
+                        // safe to push, we need to had a sv before this can occur, some one need to have pushed an empty vec
+                        self.transmit_buff.last_mut().unwrap().push(byte);
+                    }
+                }
+            }
+        }
+        let out = if i > self.block_size.saturating_sub(4) {
+            // +1 because zero indexed
+            self.miso_footer[i - (self.block_size - 4 + 1)]
+        } else {
+            self.receive_buff
+                .get(i + self.offset as usize)
+                .cloned()
+                .unwrap_or(0)
+        };
+
+        if i == self.block_size - 1 {
+            // header indicates host listend, inc offset so next block contains
+            if !self.transmit_header.norx {
+                self.offset += self.block_size as isize;
+            }
+            self.mode = ReadingHeader(0)
+        } else {
+            self.mode = ReadingWritingBlock(i + 1);
+        }
+        Ok(out)
+    }
+
+    fn handle_command(&mut self, byte: u8, i: usize) -> Result<u8, FakeTc6DeviceError> {
+        let i2 = 0usize;
+        let out = *self
+            .receive_buff
+            .get(i2 + self.offset as usize)
+            .unwrap_or(&0);
+        todo!()
+    }
+
+    fn handle_reading_command_header(
+        &mut self,
+        byte: u8,
+        i: usize,
+    ) -> Result<u8, FakeTc6DeviceError> {
+        todo!()
+    }
+
+    fn handle_byte(&mut self, byte: u8) -> Result<u8, FakeTc6DeviceError> {
+        let out = match self.mode.clone() {
+            ReadingHeader(i) => self.handle_reading_header(byte, i)?,
+            ReadingWritingBlock(i) => self.handle_reading_writing_block(byte, i)?,
+            Command(i) => self.handle_command(byte, i)?,
+            ReadingCommandHeader(i) => self.handle_reading_command_header(byte, i)?,
+        };
         Ok(out)
     }
 
@@ -157,11 +255,17 @@ impl FakeTc6Device {
         Ok(())
     }
     pub fn de_assert_cs(&mut self) -> Result<(), FakeTc6DeviceError> {
-        //TODO handle command mode
-        if !matches!(self.mode, ReadingHeader(0)) {
-            Err(FakeTc6DeviceError::DeAssertCsNotEndOfBlock)
-        } else {
-            Ok(())
+        match self.mode {
+            ReadingHeader(0) => Ok(()),
+            // if in command docs says to revert to normal mode
+            ReadingCommandHeader(0) => {
+                self.mode = ReadingHeader(0);
+                Ok(())
+            }
+            ReadingCommandHeader(_) | Command(_) => {
+                Err(FakeTc6DeviceError::DeAssertCsNotEndOfCommand)
+            }
+            _ => Err(FakeTc6DeviceError::DeAssertCsNotEndOfBlock),
         }
     }
 }
@@ -170,6 +274,7 @@ impl FakeTc6Device {
 
 pub enum FakeTc6DeviceError {
     DeAssertCsNotEndOfBlock,
+    DeAssertCsNotEndOfCommand,
 }
 
 impl Default for FakeTc6Device {
@@ -178,11 +283,14 @@ impl Default for FakeTc6Device {
     }
 }
 
+#[derive(Clone, Debug)]
 pub enum Mode {
-    // reading the the header, the u8 represents how many bytes have been read
-    ReadingHeader(u8),
-    ReadingWritingBlock(u16),
-    Command,
+    // reading the the header, the u represents how many bytes have been read
+    ReadingHeader(usize),
+    ReadingWritingBlock(usize),
+    // echo command, the u32 represents how many bytes have been sent/read
+    Command(usize),
+    ReadingCommandHeader(usize),
 }
 impl SpiDevice for FakeTc6SpiDevice {
     fn transaction(
@@ -235,14 +343,201 @@ mod test {
     }
 
     #[test]
-    fn test_transferred() {
+    fn test_transferred_is_ok() {
         init();
 
         let mut tc6 = FakeTc6SpiDevice::new();
         let mut write_buff = [0u8; 64 + 4];
+        write_buff[0] = 0b1000_0000; // dnc
+        write_buff[3] = 0b1; // parity
         let mut read_buff = [0u8; 64 + 4];
         let res = tc6.transfer(read_buff.as_mut_slice(), write_buff.as_mut_slice());
         println!("{:?}", res);
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_transferred_is_ok_with_header() {
+        init();
+
+        let header = TransmitHeader {
+            dnc: false,
+            seq: false,
+            norx: false,
+            dv: true,
+            sv: true,
+            swo: 0b1010,
+            ev: true,
+            ebo: 0b101010,
+            tsc: 0b10,
+            parity: false, // will be calculated
+        };
+    }
+
+    // builds a TransmitHeader for a data chunk (dnc = true) with the given
+    // dv/sv/swo/ev/ebo fields, parity is not checked by the device so it is left as false.
+    fn make_header(dv: bool, sv: bool, swo: u8, ev: bool, ebo: u8) -> TransmitHeader {
+        TransmitHeader {
+            dnc: true,
+            seq: false,
+            norx: false,
+            dv,
+            sv,
+            swo,
+            ev,
+            ebo,
+            tsc: 0,
+            parity: false,
+        }
+    }
+
+    // builds a full block (DEFAULT_BLOCK_SIZE bytes) filled with `filler`, with `data` written
+    // starting at byte offset `start`.
+    fn make_block(start: usize, data: &[u8], filler: u8) -> [u8; DEFAULT_BLOCK_SIZE] {
+        let mut block = [filler; DEFAULT_BLOCK_SIZE];
+        block[start..start + data.len()].copy_from_slice(data);
+        block
+    }
+
+    // sends one header + block chunk transaction (4 header bytes + DEFAULT_BLOCK_SIZE block
+    // bytes) through the device, as a single SPI transfer.
+    fn send_block(
+        tc6: &mut FakeTc6SpiDevice,
+        header: TransmitHeader,
+        block: [u8; DEFAULT_BLOCK_SIZE],
+    ) {
+        let mut write_buff = [0u8; 4 + DEFAULT_BLOCK_SIZE];
+        write_buff[..4].copy_from_slice(&header.to_bytes());
+        write_buff[4..].copy_from_slice(&block);
+        let mut read_buff = [0u8; 4 + DEFAULT_BLOCK_SIZE];
+        tc6.transfer(read_buff.as_mut_slice(), write_buff.as_mut_slice())
+            .expect("transfer should succeed");
+    }
+
+    // a frame that is fully contained within a single block (sv and ev set in the same chunk)
+    #[test]
+    fn test_frame_fully_inside_one_block() {
+        init();
+        let mut tc6 = FakeTc6SpiDevice::new();
+
+        let frame = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        // swo = 1 word (byte offset 4), ebo = 11 -> bytes 4..=11 (8 bytes)
+        let header = make_header(true, true, 1, true, 11);
+        let block = make_block(4, &frame, 0xAA);
+
+        send_block(&mut tc6, header, block);
+
+        assert_eq!(tc6.device.transmit_buff, vec![frame.to_vec()]);
+    }
+
+    // a frame that starts at the end of one block (sv, no ev) and ends at the start of the
+    // next block (ev, no sv)
+    #[test]
+    fn test_frame_starts_at_end_of_block_ends_at_start_of_next() {
+        init();
+        let mut tc6 = FakeTc6SpiDevice::new();
+
+        // swo = 14 words -> byte offset 56, so bytes 56..=63 (8 bytes) belong to the frame
+        let first_part = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let header_a = make_header(true, true, 14, false, 0);
+        let block_a = make_block(56, &first_part, 0xAA);
+        send_block(&mut tc6, header_a, block_a);
+
+        // continuation: no sv, ev with ebo = 3 -> bytes 0..=3 (4 bytes) belong to the frame
+        let second_part = [9u8, 10, 11, 12];
+        let header_b = make_header(true, false, 0, true, 3);
+        let block_b = make_block(0, &second_part, 0xAA);
+        send_block(&mut tc6, header_b, block_b);
+
+        let expected: Vec<u8> = first_part
+            .iter()
+            .chain(second_part.iter())
+            .copied()
+            .collect();
+        assert_eq!(tc6.device.transmit_buff, vec![expected]);
+    }
+
+    // a frame that starts in one block, fills a whole block in the middle (dv set, no sv/ev)
+    // and ends in a third block
+    #[test]
+    fn test_frame_start_full_block_end() {
+        init();
+        let mut tc6 = FakeTc6SpiDevice::new();
+
+        // start: swo = 8 words -> byte offset 32, so bytes 32..=63 (32 bytes) belong to the frame
+        let start_part: Vec<u8> = (1u8..=32).collect();
+        let header_a = make_header(true, true, 8, false, 0);
+        let block_a = make_block(32, &start_part, 0xAA);
+        send_block(&mut tc6, header_a, block_a);
+
+        // middle: dv set, no sv/ev -> the whole block belongs to the frame
+        let middle_part: Vec<u8> = (33u8..=96).collect();
+        let header_b = make_header(true, false, 0, false, 0);
+        let block_b: [u8; DEFAULT_BLOCK_SIZE] = middle_part.clone().try_into().unwrap();
+        send_block(&mut tc6, header_b, block_b);
+
+        // end: no sv, ev with ebo = 9 -> bytes 0..=9 (10 bytes) belong to the frame
+        let end_part: Vec<u8> = (97u8..=106).collect();
+        let header_c = make_header(true, false, 0, true, 9);
+        let block_c = make_block(0, &end_part, 0xAA);
+        send_block(&mut tc6, header_c, block_c);
+
+        let expected: Vec<u8> = start_part
+            .iter()
+            .chain(middle_part.iter())
+            .chain(end_part.iter())
+            .copied()
+            .collect();
+        assert_eq!(tc6.device.transmit_buff, vec![expected]);
+    }
+
+    // two separate, complete frames, one fitting in block one and the other in block two
+    #[test]
+    fn test_two_frames_in_two_blocks() {
+        init();
+        let mut tc6 = FakeTc6SpiDevice::new();
+
+        let frame_1 = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let header_a = make_header(true, true, 0, true, 7);
+        let block_a = make_block(0, &frame_1, 0xAA);
+        send_block(&mut tc6, header_a, block_a);
+
+        let frame_2 = [21u8, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32];
+        let header_b = make_header(true, true, 0, true, 11);
+        let block_b = make_block(0, &frame_2, 0xAA);
+        send_block(&mut tc6, header_b, block_b);
+
+        assert_eq!(
+            tc6.device.transmit_buff,
+            vec![frame_1.to_vec(), frame_2.to_vec()]
+        );
+    }
+
+    // a frame split across two blocks with a dv = 0 block inserted between them, simulating
+    // the host only receiving (no transmit data) for that chunk
+    #[test]
+    fn test_frame_with_dv_not_set_block_inserted() {
+        init();
+        let mut tc6 = FakeTc6SpiDevice::new();
+
+        // start: swo = 8 words -> byte offset 32, so bytes 32..=63 (32 bytes) belong to the frame
+        let start_part: Vec<u8> = (1u8..=32).collect();
+        let header_a = make_header(true, true, 8, false, 0);
+        let block_a = make_block(32, &start_part, 0xAA);
+        send_block(&mut tc6, header_a, block_a);
+
+        // host only receiving this chunk: dv = 0, sv/ev/swo/ebo must be 0 too
+        let header_b = make_header(false, false, 0, false, 0);
+        let block_b = [0xAAu8; DEFAULT_BLOCK_SIZE];
+        send_block(&mut tc6, header_b, block_b);
+
+        // end: no sv, ev with ebo = 9 -> bytes 0..=9 (10 bytes) belong to the frame
+        let end_part: Vec<u8> = (33u8..=42).collect();
+        let header_c = make_header(true, false, 0, true, 9);
+        let block_c = make_block(0, &end_part, 0xAA);
+        send_block(&mut tc6, header_c, block_c);
+
+        let expected: Vec<u8> = start_part.iter().chain(end_part.iter()).copied().collect();
+        assert_eq!(tc6.device.transmit_buff, vec![expected]);
     }
 }
