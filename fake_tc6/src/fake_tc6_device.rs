@@ -112,13 +112,7 @@ impl FakeTc6Device {
             self.receive_footer = ReceiveFooter::new();
         }
 
-        let i2 = i;
-        let out = *self
-            .receive_buff
-            .first_mut()
-            .unwrap_or(&mut vec![])
-            .get(i2 + self.word_offset as usize)
-            .unwrap_or(&0);
+        let out = self.get_out_byte_from_receive_buff();
 
         trace!("read byte {} of header", i);
         self.mosi_header_raw[i] = byte;
@@ -212,14 +206,19 @@ impl FakeTc6Device {
                 }
             }
         }
-        let out = if i > self.block_size.saturating_sub(4) {
-            // +1 because zero indexed
-            self.miso_footer[i - (self.block_size - 4 + 1)]
+        let out = if i >= self.block_size.saturating_sub(4) {
+            // snapshot the footer once, at the first footer byte of the block. norx is only known
+            // once the header is fully parsed, so force dv/sv/ev back off here in case the header
+            // phase bytes (read before norx was known) had already set them from real data.
+            if i == self.block_size.saturating_sub(4) {
+                if self.transmit_header.norx {
+                    self.receive_footer = ReceiveFooter::new();
+                }
+                self.miso_footer = self.receive_footer.to_bytes();
+            }
+            self.miso_footer[i - self.block_size.saturating_sub(4)]
         } else {
-            self.receive_buff
-                .first()
-                .and_then(|v| v.get(i + self.word_offset as usize).cloned())
-                .unwrap_or(0)
+            self.get_out_byte_from_receive_buff()
         };
 
         if i == self.block_size - 1 {
@@ -271,13 +270,22 @@ impl FakeTc6Device {
         }
     }
 
-    /// this functions returns the byte that should be sent on the MISO line when the master is reading from the device.
+    /// this functions returns the byte that should be sent on the MISO line when the master is reading from the device. (in data mode, not command mode)
     /// if there exist valid data to be written, it will set the dv in the footer.
     /// and it will also set the start word offset to the first byte of the frame that have data (condition, index + offset == 0)
     /// end byte will also be set to the last byte of the frame that have data (condition, index + offset == receive_buff.first().len() - 1)
     /// if a frame have been sent, it will be removed from the receive_buff and the offset will be updated
     /// if block is done it will uppdate offset so next block will start at the correct offset, if not norx
     fn get_out_byte_from_receive_buff(&mut self) -> u8 {
+        // norx means the host will ignore this chunk's payload; footer must stay all-zero and
+        // no state (word_offset, receive_buff) may change so the same data is resent next chunk.
+        // this can only be honored once the header has actually been fully parsed (block phase);
+        // during the header-phase bytes, this chunk's own norx bit isn't known yet since it's
+        // still being clocked in on MOSI, so those bytes always carry real payload data.
+        if self.transmit_header.norx && matches!(self.mode, ReadingWritingBlock(_)) {
+            return 0;
+        }
+
         let index = match self.mode {
             ReadingWritingBlock(i) => i + 4,
             ReadingHeader(i) => i,
@@ -295,21 +303,26 @@ impl FakeTc6Device {
             self.receive_footer.ebo = (index as u8) & 0b11_1111;
         }
 
+        let mut found_byte = false;
         let out = if let Some(byte) = self
             .receive_buff
             .first()
             .and_then(|v| v.get((index + self.word_offset * 4) as usize))
         {
             self.receive_footer.dv = true;
+            found_byte = true;
             *byte
         } else {
-            // if not norx and i word aligned then pop first receive buff and reset offset to -index/4
-            // we also need to make sure that we are not expecting to transmit this to host later (negative offset))
+            // pop the finished frame and realign word_offset onto the next queued frame, but only when
+            // word_offset is not already negative: a negative word_offset means the start of the next frame
+            // has deliberately been delayed to later in this block (e.g. to exercise host-side mid-block
+            // frame-start reception in tests), and that pending frame must not be skipped by popping again
+            // before its start byte has actually been reached.
             // if we have already had a start of a frame, we shuld not begin a new frame, as we can only send a signle start per block
-            if !self.transmit_header.norx
-                && index % 4 == 0
+            if index % 4 == 0
                 && self.word_offset > 0
-                && !self.transmit_header.sv
+                && !self.receive_footer.sv
+                && !self.receive_buff.is_empty()
             {
                 self.receive_buff.remove(0);
                 // assume we are at index 7, the last byte of the second word, we have already sent sent al bytes of the frame,
@@ -328,6 +341,7 @@ impl FakeTc6Device {
                 .and_then(|v| v.get((index + self.word_offset * 4) as usize))
             {
                 self.receive_footer.dv = true;
+                found_byte = true;
                 *byte
             } else {
                 0
@@ -335,16 +349,15 @@ impl FakeTc6Device {
         };
 
         // if we are at the start of a frame, set the start word offset to the first byte of the frame that have data
-        if index + self.word_offset * 4 == 0 {
+        // (only when there actually is data here, e.g. not right after popping an exhausted frame with nothing queued behind it)
+        if found_byte && index + self.word_offset * 4 == 0 {
             self.receive_footer.sv = true;
             self.receive_footer.swo = (index as u8) >> 2;
         }
 
-        // if last byte in block update offset so next block will start at the correct offset,
-        // if norx is set, it meant that the host did not listen to the last block, so we need to keep the offset as is, so that the next block will be the same as this one
-        // so the host will get the same data again, and can re-read the block ad infunitum until it listens to the block.
-        if index == self.block_size as isize - 1 && !self.transmit_header.norx {
-            self.word_offset -= (index + 1) / 4;
+        // if last byte in block update offset so next block will start at the correct offset
+        if index == self.block_size as isize - 1 {
+            self.word_offset += (index + 1) / 4;
         }
 
         out
@@ -481,18 +494,51 @@ mod test {
     }
 
     // sends one header + block chunk transaction (4 header bytes + DEFAULT_BLOCK_SIZE block
-    // bytes) through the device, as a single SPI transfer.
-    fn send_block(
+    // bytes) through the device, as a single SPI transfer, and returns the captured MISO bytes.
+    fn transfer_block(
         tc6: &mut FakeTc6SpiDevice,
         header: TransmitHeader,
         block: [u8; DEFAULT_BLOCK_SIZE],
-    ) {
+    ) -> [u8; 4 + DEFAULT_BLOCK_SIZE] {
         let mut write_buff = [0u8; 4 + DEFAULT_BLOCK_SIZE];
         write_buff[..4].copy_from_slice(&header.to_bytes());
         write_buff[4..].copy_from_slice(&block);
         let mut read_buff = [0u8; 4 + DEFAULT_BLOCK_SIZE];
         tc6.transfer(read_buff.as_mut_slice(), write_buff.as_mut_slice())
             .expect("transfer should succeed");
+        read_buff
+    }
+
+    // sends one header + block chunk transaction (4 header bytes + DEFAULT_BLOCK_SIZE block
+    // bytes) through the device, as a single SPI transfer.
+    fn send_block(
+        tc6: &mut FakeTc6SpiDevice,
+        header: TransmitHeader,
+        block: [u8; DEFAULT_BLOCK_SIZE],
+    ) {
+        transfer_block(tc6, header, block);
+    }
+
+    // splits the MISO bytes captured for one header+block transaction into the receive payload
+    // and footer, decodes the footer, and returns the sub-slice of the payload it marks as valid
+    // receive frame data (empty if dv is not set).
+    fn receive_valid_data(read_buff: &[u8]) -> &[u8] {
+        let (block, footer) = read_buff.split_at(DEFAULT_BLOCK_SIZE);
+        let footer = ReceiveFooter::from_slice(footer).unwrap();
+        if !footer.dv {
+            return &block[..0];
+        }
+        let start = if footer.sv {
+            footer.swo as usize * 4
+        } else {
+            0
+        };
+        let end = if footer.ev {
+            footer.ebo as usize + 1
+        } else {
+            block.len()
+        };
+        &block[start..end]
     }
 
     // a frame that is fully contained within a single block (sv and ev set in the same chunk)
@@ -620,5 +666,124 @@ mod test {
 
         let expected: Vec<u8> = start_part.iter().chain(end_part.iter()).copied().collect();
         assert_eq!(tc6.device.transmit_buff, vec![expected]);
+    }
+
+    // a receive frame that fits entirely within a single block, starting at the very first byte
+    #[test]
+    fn test_receive_frame_fully_inside_one_block() {
+        init();
+        let mut tc6 = FakeTc6SpiDevice::new();
+
+        let frame = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        tc6.device.receive_buff.push(frame.to_vec());
+
+        let header = make_header(false, false, 0, false, 0);
+        let read_buff = transfer_block(&mut tc6, header, [0u8; DEFAULT_BLOCK_SIZE]);
+
+        assert_eq!(receive_valid_data(&read_buff), frame);
+    }
+
+    // a receive frame that fills an entire first block and finishes partway into the second,
+    // which should also cause the (now fully sent) frame to be popped from the receive queue
+    #[test]
+    fn test_receive_frame_spanning_two_blocks() {
+        init();
+        let mut tc6 = FakeTc6SpiDevice::new();
+
+        let frame: Vec<u8> = (1u8..=70).collect();
+        tc6.device.receive_buff.push(frame.clone());
+
+        let header = make_header(false, false, 0, false, 0);
+
+        let read_a = transfer_block(&mut tc6, header, [0u8; DEFAULT_BLOCK_SIZE]);
+        let read_b = transfer_block(&mut tc6, header, [0u8; DEFAULT_BLOCK_SIZE]);
+
+        let mut received: Vec<u8> = vec![];
+        received.extend_from_slice(receive_valid_data(&read_a));
+        received.extend_from_slice(receive_valid_data(&read_b));
+        assert_eq!(received, frame);
+
+        assert!(tc6.device.receive_buff.is_empty());
+    }
+
+    // word_offset can be preset to a negative value to delay a frame's start to the middle of a
+    // block, e.g. to test that the host correctly handles a receive frame starting mid-block
+    #[test]
+    fn test_receive_frame_delayed_start_mid_block() {
+        init();
+        let mut tc6 = FakeTc6SpiDevice::new();
+
+        let frame = [11u8, 12, 13, 14, 15, 16];
+        let start = 32;
+        tc6.device.receive_buff.push(frame.to_vec());
+        tc6.device.word_offset = -((start / 4) as isize);
+
+        let header = make_header(false, false, 0, false, 0);
+        let read_buff = transfer_block(&mut tc6, header, [0u8; DEFAULT_BLOCK_SIZE]);
+
+        assert_eq!(&read_buff[..start], vec![0u8; start]);
+        assert_eq!(receive_valid_data(&read_buff), frame);
+    }
+
+    // a receive frame that starts at the end of one block, fills an entire block in the middle,
+    // and ends at the start of a third block
+    #[test]
+    fn test_receive_frame_start_full_block_end() {
+        init();
+        let mut tc6 = FakeTc6SpiDevice::new();
+
+        let frame: Vec<u8> = (1u8..=106).collect();
+        tc6.device.receive_buff.push(frame.clone());
+        // delay the start of the frame to byte 32 of the first block
+        tc6.device.word_offset = -8;
+
+        let header = make_header(false, false, 0, false, 0);
+
+        let read_a = transfer_block(&mut tc6, header, [0u8; DEFAULT_BLOCK_SIZE]);
+        let read_b = transfer_block(&mut tc6, header, [0u8; DEFAULT_BLOCK_SIZE]);
+        let read_c = transfer_block(&mut tc6, header, [0u8; DEFAULT_BLOCK_SIZE]);
+
+        let mut received: Vec<u8> = vec![];
+        received.extend_from_slice(receive_valid_data(&read_a));
+        received.extend_from_slice(receive_valid_data(&read_b));
+        received.extend_from_slice(receive_valid_data(&read_c));
+        assert_eq!(received, frame);
+
+        assert!(tc6.device.receive_buff.is_empty());
+    }
+
+    // a receive frame split across two blocks with a norx block inserted between them,
+    // simulating the host asking the MAC-PHY to hold and resend the same data later
+    #[test]
+    fn test_receive_frame_with_norx_block_inserted() {
+        init();
+        let mut tc6 = FakeTc6SpiDevice::new();
+
+        let frame: Vec<u8> = (1u8..=42).collect();
+        tc6.device.receive_buff.push(frame.clone());
+        // delay the start of the frame to byte 32 of the first block
+        tc6.device.word_offset = -8;
+
+        let header = make_header(false, false, 0, false, 0);
+        let norx_header = TransmitHeader {
+            norx: true,
+            ..header
+        };
+
+        let read_a = transfer_block(&mut tc6, header, [0u8; DEFAULT_BLOCK_SIZE]);
+
+        // host is not listening this chunk: footer must be all-zero and the frame retained
+        let read_norx = transfer_block(&mut tc6, norx_header, [0xAAu8; DEFAULT_BLOCK_SIZE]);
+        assert!(receive_valid_data(&read_norx).is_empty());
+        assert_eq!(tc6.device.receive_buff, vec![frame.clone()]);
+
+        let read_b = transfer_block(&mut tc6, header, [0u8; DEFAULT_BLOCK_SIZE]);
+
+        let mut received: Vec<u8> = vec![];
+        received.extend_from_slice(receive_valid_data(&read_a));
+        received.extend_from_slice(receive_valid_data(&read_b));
+        assert_eq!(received, frame);
+
+        assert!(tc6.device.receive_buff.is_empty());
     }
 }
