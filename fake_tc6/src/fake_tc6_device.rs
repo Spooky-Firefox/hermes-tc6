@@ -1,5 +1,6 @@
 use crate::{
     fake_tc6_device::Mode::{Command, ReadingCommandHeader, ReadingHeader, ReadingWritingBlock},
+    receive_footer::{self, ReceiveFooter},
     transmit_header::TransmitHeader,
 };
 use embedded_hal::spi::{self, Operation, SpiDevice};
@@ -22,7 +23,7 @@ impl FakeTc6SpiDevice {
 
     fn helper_read(&mut self, buf: &mut [u8]) -> Result<(), FakeTc6SpiDeviceError> {
         for byte in buf {
-            if !matches!(self.device.mode, ReadingWritingBlock(_)) {
+            if self.device.is_reading_header() {
                 warn!("mode is not block, please make sure you have written the header")
             }
             *byte = self.device.handle_byte(0)?
@@ -72,13 +73,14 @@ pub struct FakeTc6Device {
     transmit_header: TransmitHeader,
     // the footer the mac-phy responds with
     miso_footer: [u8; 4],
+    receive_footer: ReceiveFooter,
 
     // offset in frame buff that the current block output should start at IN WORDS NOT BYTES
-    offset: isize,
+    word_offset: isize,
     // buffer of eth frames to be sent on wire
     transmit_buff: vec::Vec<vec::Vec<u8>>,
     // buffer of received eth frames from wire
-    receive_buff: vec::Vec<u8>,
+    receive_buff: vec::Vec<vec::Vec<u8>>,
 }
 
 impl FakeTc6Device {
@@ -89,14 +91,15 @@ impl FakeTc6Device {
             mosi_header_raw: [0; 4],
             transmit_header: TransmitHeader::new(),
             miso_footer: [0; 4],
-            offset: 0,
+            word_offset: 0,
             transmit_buff: Vec::new(),
             receive_buff: Vec::new(),
+            receive_footer: ReceiveFooter::new(),
         }
     }
 
     fn is_reading_header(&self) -> bool {
-        matches!(self.mode, ReadingHeader(_))
+        matches!(self.mode, ReadingHeader(_) | ReadingCommandHeader(_))
     }
 
     fn is_sending_footer(&self) -> bool {
@@ -104,10 +107,17 @@ impl FakeTc6Device {
     }
 
     fn handle_reading_header(&mut self, byte: u8, i: usize) -> Result<u8, FakeTc6DeviceError> {
+        // when starting a new block, reset the receive footer to default values
+        if i == 0 {
+            self.receive_footer = ReceiveFooter::new();
+        }
+
         let i2 = i;
         let out = *self
             .receive_buff
-            .get(i2 + self.offset as usize)
+            .first_mut()
+            .unwrap_or(&mut vec![])
+            .get(i2 + self.word_offset as usize)
             .unwrap_or(&0);
 
         trace!("read byte {} of header", i);
@@ -207,16 +217,13 @@ impl FakeTc6Device {
             self.miso_footer[i - (self.block_size - 4 + 1)]
         } else {
             self.receive_buff
-                .get(i + self.offset as usize)
-                .cloned()
+                .first()
+                .and_then(|v| v.get(i + self.word_offset as usize).cloned())
                 .unwrap_or(0)
         };
 
         if i == self.block_size - 1 {
             // header indicates host listend, inc offset so next block contains
-            if !self.transmit_header.norx {
-                self.offset += self.block_size as isize;
-            }
             self.mode = ReadingHeader(0)
         } else {
             self.mode = ReadingWritingBlock(i + 1);
@@ -225,11 +232,6 @@ impl FakeTc6Device {
     }
 
     fn handle_command(&mut self, byte: u8, i: usize) -> Result<u8, FakeTc6DeviceError> {
-        let i2 = 0usize;
-        let out = *self
-            .receive_buff
-            .get(i2 + self.offset as usize)
-            .unwrap_or(&0);
         todo!()
     }
 
@@ -267,6 +269,85 @@ impl FakeTc6Device {
             }
             _ => Err(FakeTc6DeviceError::DeAssertCsNotEndOfBlock),
         }
+    }
+
+    /// this functions returns the byte that should be sent on the MISO line when the master is reading from the device.
+    /// if there exist valid data to be written, it will set the dv in the footer.
+    /// and it will also set the start word offset to the first byte of the frame that have data (condition, index + offset == 0)
+    /// end byte will also be set to the last byte of the frame that have data (condition, index + offset == receive_buff.first().len() - 1)
+    /// if a frame have been sent, it will be removed from the receive_buff and the offset will be updated
+    /// if block is done it will uppdate offset so next block will start at the correct offset, if not norx
+    fn get_out_byte_from_receive_buff(&mut self) -> u8 {
+        let index = match self.mode {
+            ReadingWritingBlock(i) => i + 4,
+            ReadingHeader(i) => i,
+            _ => {
+                warn!("get_out_byte_from_receive_buff called in invalid mode");
+                0
+            }
+        } as isize;
+
+        // if we are the last byte of a frame set the end byte offset
+        if index + self.word_offset * 4
+            == self.receive_buff.first().map(|v| v.len()).unwrap_or(0) as isize - 1
+        {
+            self.receive_footer.ev = true;
+            self.receive_footer.ebo = (index as u8) & 0b11_1111;
+        }
+
+        let out = if let Some(byte) = self
+            .receive_buff
+            .first()
+            .and_then(|v| v.get((index + self.word_offset * 4) as usize))
+        {
+            self.receive_footer.dv = true;
+            *byte
+        } else {
+            // if not norx and i word aligned then pop first receive buff and reset offset to -index/4
+            // we also need to make sure that we are not expecting to transmit this to host later (negative offset))
+            // if we have already had a start of a frame, we shuld not begin a new frame, as we can only send a signle start per block
+            if !self.transmit_header.norx
+                && index % 4 == 0
+                && self.word_offset > 0
+                && !self.transmit_header.sv
+            {
+                self.receive_buff.remove(0);
+                // assume we are at index 7, the last byte of the second word, we have already sent sent al bytes of the frame,
+                // the later first_mut will send zero.
+                // we now go to the next byte, byte 8, the first byte of the third.
+                // we need to set the offset to -2, so that the first_mut will send the first byte of the next frame.
+                // 8 + word_offset * 4 = 0, word_offset = -2
+                //word_offset *4= -8
+                // word_offset = -index / 4;
+                self.word_offset = -index / 4;
+            }
+            // cant just return zero here as we might have the next frame
+            if let Some(byte) = self
+                .receive_buff
+                .first_mut()
+                .and_then(|v| v.get((index + self.word_offset * 4) as usize))
+            {
+                self.receive_footer.dv = true;
+                *byte
+            } else {
+                0
+            }
+        };
+
+        // if we are at the start of a frame, set the start word offset to the first byte of the frame that have data
+        if index + self.word_offset * 4 == 0 {
+            self.receive_footer.sv = true;
+            self.receive_footer.swo = (index as u8) >> 2;
+        }
+
+        // if last byte in block update offset so next block will start at the correct offset,
+        // if norx is set, it meant that the host did not listen to the last block, so we need to keep the offset as is, so that the next block will be the same as this one
+        // so the host will get the same data again, and can re-read the block ad infunitum until it listens to the block.
+        if index == self.block_size as isize - 1 && !self.transmit_header.norx {
+            self.word_offset -= (index + 1) / 4;
+        }
+
+        out
     }
 }
 
