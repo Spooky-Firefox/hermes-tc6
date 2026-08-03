@@ -11,7 +11,7 @@ const DEFAULT_BLOCK_SIZE: usize = 64;
 
 // exist because borrow checker
 pub struct FakeTc6SpiDevice {
-    device: FakeTc6Device,
+    pub device: FakeTc6Device,
 }
 
 impl FakeTc6SpiDevice {
@@ -56,7 +56,10 @@ impl FakeTc6SpiDevice {
     }
 
     fn helper_transfer_in_place(&mut self, _buf: &mut [u8]) -> Result<(), FakeTc6SpiDeviceError> {
-        todo!()
+        for b in _buf.iter_mut() {
+            *b = self.device.handle_byte(*b)?;
+        }
+        Ok(())
     }
 }
 
@@ -95,6 +98,35 @@ impl FakeTc6Device {
             transmit_buff: Vec::new(),
             receive_buff: Vec::new(),
             receive_footer: ReceiveFooter::new(),
+        }
+    }
+
+    // this is ment to enqueue a frame to be sent to the host, it will be sent in the next block that is read from the device
+    pub fn enqueue_receive_frame(&mut self, frame: Vec<u8>) {
+        self.receive_buff.push(frame);
+    }
+
+    // this is meant to pop a frame that has been sent from the host,
+    pub fn pop_transmit_frame(&mut self) -> Option<Vec<u8>> {
+        self.transmit_buff.pop()
+    }
+
+    pub fn assert_cs(&mut self) -> Result<(), FakeTc6DeviceError> {
+        Ok(())
+    }
+
+    pub fn de_assert_cs(&mut self) -> Result<(), FakeTc6DeviceError> {
+        match self.mode {
+            ReadingHeader(0) => Ok(()),
+            // if in command docs says to revert to normal mode
+            ReadingCommandHeader(0) => {
+                self.mode = ReadingHeader(0);
+                Ok(())
+            }
+            ReadingCommandHeader(_) | Command(_) => {
+                Err(FakeTc6DeviceError::DeAssertCsNotEndOfCommand)
+            }
+            _ => Err(FakeTc6DeviceError::DeAssertCsNotEndOfBlock),
         }
     }
 
@@ -250,24 +282,6 @@ impl FakeTc6Device {
             ReadingCommandHeader(i) => self.handle_reading_command_header(byte, i)?,
         };
         Ok(out)
-    }
-
-    pub fn assert_cs(&mut self) -> Result<(), FakeTc6SpiDeviceError> {
-        Ok(())
-    }
-    pub fn de_assert_cs(&mut self) -> Result<(), FakeTc6DeviceError> {
-        match self.mode {
-            ReadingHeader(0) => Ok(()),
-            // if in command docs says to revert to normal mode
-            ReadingCommandHeader(0) => {
-                self.mode = ReadingHeader(0);
-                Ok(())
-            }
-            ReadingCommandHeader(_) | Command(_) => {
-                Err(FakeTc6DeviceError::DeAssertCsNotEndOfCommand)
-            }
-            _ => Err(FakeTc6DeviceError::DeAssertCsNotEndOfBlock),
-        }
     }
 
     /// this functions returns the byte that should be sent on the MISO line when the master is reading from the device. (in data mode, not command mode)

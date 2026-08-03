@@ -98,8 +98,7 @@ impl ControlHeader {
             + self.mms.count_ones()
             + ((self.addr >> 8) as u8).count_ones()
             + (self.addr as u8).count_ones()
-            + self.len.count_ones()
-            % 2
+            + self.len.count_ones() % 2
             == 0
     }
 
