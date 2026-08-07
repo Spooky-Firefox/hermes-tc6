@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+embedded-dma = "0.2.0"
+embedded-hal = "1.0.0"
+# "pool" (used by tc6_driver) needs portable-atomic on targets without native wide-CAS/arm_llsc;
+# swap for "portable-atomic-unsafe-assume-single-core" if you'd rather not depend on a
+# critical-section impl being registered, but only on genuinely single-core MCUs.
+heapless = { version = "0.9.3", features = ["portable-atomic-critical-section"] }
+smoltcp = "0.13.1"
