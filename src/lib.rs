@@ -9,6 +9,10 @@ pub mod embeded_io_implementation;
 pub mod tc6_interface;
 
 pub mod tc6_driver;
+
+mod bitfield;
+pub mod tc6_footer;
+pub mod tc6_header;
 #[cfg(test)]
 mod tests {
     use std::vec;

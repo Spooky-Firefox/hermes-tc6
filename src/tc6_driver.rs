@@ -1,5 +1,7 @@
 use crate::tc6_interface::Tc6Interface;
+use crate::{tc6_footer, tc6_header};
 use core::mem::MaybeUninit;
+use embedded_dma::{ReadBuffer, WriteBuffer};
 use heapless::pool::boxed::{Box, BoxPool};
 use heapless::spsc::{Consumer, Producer, Queue};
 
@@ -11,11 +13,99 @@ use heapless::spsc::{Consumer, Producer, Queue};
 /// `pub` because the application must name this type concretely in its own `box_pool!` call.
 pub struct FrameBuffer<const M: usize> {
     start: usize,
-    length: usize,
+    len: usize,
     buffer: [MaybeUninit<u8>; M],
 }
 
-enum TC6DriverMode {
+// TODO, is this a good idea? this was a hack to avoid the lifetime issues with passing &mut [u8] to the tc6 interface
+struct DMAPtr {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl DMAPtr {
+    fn from_slice(slice: &mut [u8]) -> Self {
+        Self {
+            ptr: slice.as_mut_ptr(),
+            len: slice.len(),
+        }
+    }
+}
+
+unsafe impl WriteBuffer for DMAPtr {
+    type Word = u8;
+
+    unsafe fn write_buffer(&mut self) -> (*mut Self::Word, usize) {
+        (self.ptr, self.len)
+    }
+}
+
+unsafe impl ReadBuffer for DMAPtr {
+    type Word = u8;
+
+    unsafe fn read_buffer(&self) -> (*const Self::Word, usize) {
+        (self.ptr, self.len)
+    }
+}
+
+impl<const M: usize> FrameBuffer<M> {
+    const fn new() -> Self {
+        Self {
+            start: 0,
+            len: 0,
+            buffer: [MaybeUninit::uninit(); M],
+        }
+    }
+
+    /// this function gets a mutable slice to the uninitialized portion of the buffer, starting at the end of the initialized portion. The caller is responsible for writing to this slice and then calling `add_len` to update the length of the initialized portion.
+    unsafe fn get_mut_at_end(&mut self, len: usize) -> &mut [u8] {
+        let end = self.start + self.len;
+        assert!(end + len <= M);
+        let ptr = unsafe { self.buffer.as_mut_ptr().add(end) } as *mut u8;
+        unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+    }
+
+    unsafe fn add_len(&mut self, len: usize) {
+        let end = self.start + self.len;
+        assert!(end + len <= M);
+        self.len += len;
+    }
+
+    unsafe fn get_raw_from_index(&self, index: usize, len: usize) -> &[u8] {
+        let end = self.start + self.len;
+        assert!(index + len <= end);
+        let ptr = unsafe { self.buffer.as_ptr().add(index) } as *const u8;
+        unsafe { core::slice::from_raw_parts(ptr, len) }
+    }
+
+    unsafe fn get_raw_mut_from_index(&mut self, index: usize, len: usize) -> &mut [u8] {
+        let end = self.start + self.len;
+        assert!(index + len <= end);
+        let ptr = unsafe { self.buffer.as_mut_ptr().add(index) } as *mut u8;
+        unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+    }
+
+    /// View the initialized portion as a normal &[u8].
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: bytes in [start, start+len) are guaranteed initialized
+        // by the write_at/len invariant.
+        unsafe {
+            let ptr = self.buffer.as_ptr().add(self.start) as *const u8;
+            core::slice::from_raw_parts(ptr, self.len)
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: bytes in [start, start+len) are guaranteed initialized
+        // by the write_at/len invariant.
+        unsafe {
+            let ptr = self.buffer.as_mut_ptr().add(self.start) as *mut u8;
+            core::slice::from_raw_parts_mut(ptr, self.len)
+        }
+    }
+}
+
+enum TC6DriverState {
     Idle,
     WaitingForTransmitComplete,
 }
@@ -36,10 +126,12 @@ where
     TxP: BoxPool<Data = FrameBuffer<M>> + 'static,
 {
     interface: T,
-    driver_mode: TC6DriverMode,
-    current_transmit_buffer_length: usize, // keeps track of how much have been written to the tc6 interface, so we know what to transfer in the next block
+    current_transmit_buffer: Option<Box<TxP>>, // the frame currently being transmitted, if any
+    current_receive_buffer: Option<Box<RxP>>,  // the frame currently being received, if any
+    driver_state: TC6DriverState,
+    current_transmit_buffer_cursor: usize, // keeps track of how much have been written to the tc6 interface, so we know what to transfer in the next block
     scratch_header: [u8; 4], // used for temporary storage of the header in the case where a block needs to be moved
-    scratch_buffer: [u8; 64], // used for temporary storage of a block in the case where a block needs to be moved
+    scratch_buffer: [u8; 68], // used for temporary storage of a block in the case where a block needs to be moved
     rx_ready_producer: Producer<'static, Box<RxP>>, // frames pulled off the wire, handed to the low-prio side
     tx_ready_consumer: Consumer<'static, Box<TxP>>, // frames built by the low-prio side, waiting to go out over SPI
 }
@@ -81,10 +173,12 @@ where
     (
         TC6HighPrio {
             interface,
-            driver_mode: TC6DriverMode::Idle,
-            current_transmit_buffer_length: 0,
+            driver_state: TC6DriverState::Idle,
+            current_transmit_buffer_cursor: 0,
             scratch_header: [0; 4],
-            scratch_buffer: [0; 64],
+            scratch_buffer: [0; 68],
+            current_transmit_buffer: None,
+            current_receive_buffer: None,
             rx_ready_producer,
             tx_ready_consumer,
         },
@@ -108,18 +202,166 @@ where
     // rather than assuming which source triggered it, so spurious or overlapping calls are fine.
     pub fn on_interrupt(&mut self) -> Result<(), T::Error> {
         // we might have a frame to receive
-        todo!()
+        loop {
+            match self.driver_state {
+                TC6DriverState::Idle => self.handle_idle()?,
+                TC6DriverState::WaitingForTransmitComplete => {
+                    if self.interface.transfer_complete()? {
+                        self.handle_transmit_complete()?;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     // This should be called whenever the low-prio side may have queued a frame to transmit:
     // either from whatever `TransmitSignal::signal` triggers, or from periodic polling if the
     // caller would rather not wire up a signal at all.
     pub fn on_transmit_ready(&mut self) -> Result<(), T::Error> {
-        if matches!(self.driver_mode, TC6DriverMode::Idle) {
+        if matches!(self.driver_state, TC6DriverState::Idle) {
             // still waiting for the previous transfer to complete, so we can't start a new one yet
             return Ok(());
         }
         todo!()
+    }
+
+    fn handle_transmit_complete(&mut self) -> Result<(), T::Error> {
+        let bytes = if let (Some(transmit_frame), Some(receive_frame)) = (
+            self.current_transmit_buffer.as_mut(),
+            self.current_receive_buffer.as_mut(),
+        ) {
+            // read the footer
+            // Safety, before this function can be called, we have started a block send, and transferred is complete have passed,
+            // so the tc6 chip should have populated the 68 bytes at the end of the receive frame
+            // that we sent in handle idle, so we can read the footer from the receive frame
+            unsafe { receive_frame.get_mut_at_end(68) }
+        } else if self.current_transmit_buffer.as_mut().is_some() {
+            // read the footer
+            &mut self.scratch_buffer
+        } else if let Some(receive_frame) = self.current_receive_buffer.as_mut() {
+            // read the footer
+            // Safety, before this function can be called, we have started a block send, and transferred is complete have passed,
+            // so the tc6 chip should have populated the 68 bytes at the end of the receive frame
+            // that we sent in handle idle, so we can read the footer from the receive frame
+            unsafe { receive_frame.get_mut_at_end(68) }
+        } else {
+            unreachable!(
+                "how did we get here? We can't have a transfer complete without either the goal of reading (Some(ReceiveFrame)), or writing (Some(TransmitFrame)) or both, so this should not happen"
+            )
+        };
+
+        let footer = tc6_footer::ReceiveFooter::from_bytes(bytes[64..68].try_into().unwrap());
+
+        if footer.dv() {
+            if let Some(receive_frame) = self.current_receive_buffer.as_mut() {
+                // if receive frame is empty, make sure to set start correctly,
+                if !receive_frame.as_slice().is_empty() {
+                    if footer.sv() {
+                        receive_frame.start = (footer.swo() << 2) as usize;
+                        if footer.ev() {
+                            receive_frame.len = (footer.ebo() + 1) as usize - receive_frame.start;
+                            // todo send block on spsc queue to the low-prio side, and try to get a new box from the pool
+                        } else {
+                            // note that setting start is unsafe, but since its defined in the module we can acces fields as they were safe, THIS NEED TO CHANGE
+                            receive_frame.len = 64 - receive_frame.start;
+                        }
+                    } else {
+                        if footer.ev() {
+                            unsafe { receive_frame.add_len(footer.ebo() as usize + 1) }
+                            // todo send block on spsc queue to the low-prio side, and try to get a new box from the pool
+                        } else {
+                            unsafe { receive_frame.add_len(64) }
+                        }
+                    }
+                } else {
+                }
+            } else {
+                // if we have no receive frame, then we have sent the norx flag with the header, so we can safely ignore the data.
+                // TODO check header for other stuff eg extended status bit, and amount of blocks that can be sent. and other book keeping
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_idle(&mut self) -> Result<(), T::Error> {
+        // do we have a recive buffer ready to fill? if not allocate one from the pool and queue it up for the tc6 chip to fill
+        if self.current_receive_buffer.is_none() {
+            // TODO make sure the compiler is smart and avoids a hugely expensive copy/move of the FrameBuffer struct here, since it is a large array. It should be optimized away by the compiler, but we should check.
+            self.current_receive_buffer = RxP::alloc(FrameBuffer::new()).ok();
+        }
+
+        if self.current_transmit_buffer.is_none() {
+            // do we have a transmit buffer ready to send? if not, try to get one from the low-prio side
+            self.current_transmit_buffer = self.tx_ready_consumer.dequeue();
+            self.current_transmit_buffer_cursor = 0;
+        }
+
+        // if we have a transmit buffer ready send that
+        if let Some(frame) = self.current_transmit_buffer.as_mut() {
+            let len = frame.as_slice()[self.current_transmit_buffer_cursor..].len();
+            let mut header = tc6_header::TransmitHeader::new();
+            header = header.with_dv(true);
+
+            // end valid, if current block fits the last bit of the frame,
+            let ev = len <= 64;
+            header = header.with_ev(ev);
+            // end byte offset, if current block fits the last bit of the frame,
+            // then which byte in the frame is the last byte
+            // -1, because zero indexed, and the end byte offset is inclusive, so if the frame is 1 byte long, the end byte offset is 0
+            let ebo: u8 = if ev { len as u8 - 1 } else { 0 };
+            header = header.with_ebo(ebo);
+
+            if self.current_transmit_buffer_cursor == 0 {
+                // we have no space we can use to write a header, so we can not use the more efficient write joined
+                // also this is the start of data transmission, sv = 1, swo = 0.
+                header = header.with_sv(true);
+                header = header.with_swo(0);
+                //safety: we are reading from a valid index, we might read more than what is initialized, but the swo and ebo will tell the tc6 chip how much of the data is valid, so it will ignore the rest
+                let data = unsafe {
+                    DMAPtr::from_slice(
+                        frame.get_raw_mut_from_index(self.current_transmit_buffer_cursor, 64),
+                    )
+                };
+
+                // we can't receive any data due to some reason,(like full receive box pool)
+                if self.current_receive_buffer.is_none() {
+                    header = header.with_norx(true)
+                }
+
+                let result = if let Some(f) = self.current_receive_buffer.as_mut() {
+                    // SAFETY, we are writing to a point which is outside what is considered initialized, and we are not marking this part as initialized,
+                    // that is done when we read the footer returned from the tc6 chip, and then we can determine what is valid and update the length.
+                    unsafe { DMAPtr::from_slice(f.get_mut_at_end(68)) }
+                } else {
+                    DMAPtr::from_slice(&mut self.scratch_buffer)
+                };
+                // TODO parity bit
+                let header_raw: u32 = header.raw();
+                self.interface.begin_send_block(header_raw, data, result)?;
+                self.driver_state = TC6DriverState::WaitingForTransmitComplete;
+            } else {
+                // todo
+                // update swap header with transmit_buff cursor -4 to allow for sending the header and data in one go, save to overwriten data to scratch header.
+            }
+        } else if let Some(f) = self.current_receive_buffer.as_mut() {
+            // irq fired, we have data to be read
+            let mut header = tc6_header::TransmitHeader::new();
+            // we dont have any data to send, so dv = 0
+            header = header.with_dv(false);
+            self.scratch_buffer[0..4].copy_from_slice(&header.raw().to_be_bytes());
+            let data = DMAPtr::from_slice(&mut self.scratch_buffer);
+            // SAFETY, we are writing to a point which is outside what is considered initialized, and we are not marking this part as initialized,
+            // that is done when we read the footer returned from the tc6 chip, and then we can determine what is valid and update the length.
+            let result = unsafe { DMAPtr::from_slice(f.get_mut_at_end(68)) };
+            self.interface.begin_send_joined_block(data, result)?;
+        } else {
+            // irq fired, but we have no data to send nor space to receive data
+            todo!("what should we do here?")
+        }
+        Ok(())
     }
 }
 
