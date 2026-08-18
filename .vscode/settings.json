@@ -1,6 +1,10 @@
 {
     "cSpell.words": [
         "Deque",
-        "smoltcp"
+        "heapless",
+        "norx",
+        "RTIC",
+        "smoltcp",
+        "spsc"
     ]
 }
