@@ -11,6 +11,7 @@ pub mod tc6_interface;
 pub mod tc6_driver;
 
 mod bitfield;
+pub mod frame_buffer;
 pub mod tc6_footer;
 pub mod tc6_header;
 #[cfg(test)]
