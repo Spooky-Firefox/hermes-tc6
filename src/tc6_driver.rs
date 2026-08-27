@@ -4,6 +4,7 @@ use crate::{frame_buffer::FrameBuffer, tc6_footer, tc6_header};
 use embedded_dma::{ReadBuffer, WriteBuffer};
 use heapless::pool::boxed::{Box, BoxPool};
 use heapless::spsc::{Consumer, Producer, Queue};
+use smoltcp::phy::DeviceCapabilities;
 
 // NOTE: `box_pool!` singletons must name a concrete type, so `RxP`/`TxP` (and the `M` they were
 // built with) have to be declared by the application, not by this generic driver. Pass the
@@ -163,7 +164,8 @@ where
             // still waiting for the previous transfer to complete, so we can't start a new one yet
             return Ok(());
         }
-        todo!()
+        self.handle_idle()?;
+        Ok(())
     }
 
     fn handle_transmit_complete(&mut self) -> Result<(), T::Error> {
@@ -209,6 +211,7 @@ where
         assert!(self.current_receive_buffer.is_some());
         let receive_frame = self.current_receive_buffer.as_mut().unwrap();
         // if receive frame is empty,
+        let frame_done: bool;
         if receive_frame.as_slice().is_empty() {
             if footer.sv() {
                 unsafe { receive_frame.set_start((footer.swo() << 2) as usize) };
@@ -216,9 +219,10 @@ where
                     unsafe {
                         receive_frame.add_len(footer.ebo() as usize + 1 - footer.swo() as usize * 4)
                     }
-                    // TODO send block on spsc queue to the low-prio side
+                    frame_done = true;
                 } else {
                     unsafe { receive_frame.add_len(64 - footer.swo() as usize * 4) };
+                    frame_done = false;
                 }
             } else {
                 panic!(
@@ -246,12 +250,19 @@ where
 
             if footer.ev() {
                 unsafe { receive_frame.add_len(footer.ebo() as usize + 1) }
-                // TODO  send block on spsc queue to the low-prio side, and try to get a new box from the pool
+                frame_done = true;
                 self.current_receive_buffer = None;
             } else {
                 // dv is set, but ev and sv not set so whole block is valid and its ok to add the whole block to the receive frame
                 unsafe { receive_frame.add_len(64) }
+                frame_done = false;
             }
+        }
+
+        if frame_done {
+            self.rx_ready_producer
+                .enqueue(self.current_receive_buffer.take().unwrap())
+                .unwrap();
         }
         Ok(())
     }
@@ -316,7 +327,7 @@ where
                 } else {
                     DMAPtr::from_slice(&mut self.scratch_buffer)
                 };
-                // TODO parity bit
+                header = header.with_correct_parity();
                 let header_raw: u32 = header.raw();
                 self.interface.begin_send_block(header_raw, data, result)?;
                 self.driver_state = TC6DriverState::WaitingForTransmitComplete;
@@ -351,11 +362,11 @@ impl<RxP, const M: usize> smoltcp::phy::RxToken for TC6DriverRxToken<RxP>
 where
     RxP: BoxPool<Data = FrameBuffer<M>> + 'static,
 {
-    fn consume<R, F>(self, _f: F) -> R
+    fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        todo!()
+        f(self.frame.as_slice())
     }
 
     fn meta(&self) -> smoltcp::phy::PacketMeta {
@@ -363,19 +374,28 @@ where
     }
 }
 
-pub struct TC6DriverTxToken<TxP: BoxPool> {
+pub struct TC6DriverTxToken<'a, TxP: BoxPool + 'static> {
     frame: Box<TxP>,
+    queue: &'a mut Producer<'static, Box<TxP>>,
 }
 
-impl<TxP, const M: usize> smoltcp::phy::TxToken for TC6DriverTxToken<TxP>
+impl<'a, TxP, const M: usize> smoltcp::phy::TxToken for TC6DriverTxToken<'a, TxP>
 where
     TxP: BoxPool<Data = FrameBuffer<M>> + 'static,
 {
-    fn consume<R, F>(self, _len: usize, _f: F) -> R
+    fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        todo!()
+        let TC6DriverTxToken { mut frame, queue } = self;
+        // sayfty we say that this is intilized, as we assume that FnOnce will write to the buffer
+        let r = unsafe {
+            frame.add_len(len);
+            f(frame.as_mut_slice())
+        };
+
+        queue.enqueue(frame).unwrap();
+        r
     }
 }
 
@@ -391,12 +411,18 @@ where
     where
         Self: 'a;
     type TxToken<'a>
-        = TC6DriverTxToken<TxP>
+        = TC6DriverTxToken<'a, TxP>
     where
         Self: 'a;
 
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
-        todo!()
+        let mut cap = DeviceCapabilities::default();
+        cap.medium = smoltcp::phy::Medium::Ethernet;
+        cap.max_burst_size = Some(NQ);
+        // set default checksum capabilities, which is calculate and verify by software (TODO find out if this is the case, and that i have not mixed it up)
+        cap.checksum = smoltcp::phy::ChecksumCapabilities::default();
+        cap.max_transmission_unit = M; //TODO actually determine what the correct MTU should be for a ethernet frame
+        cap
     }
 
     fn receive(
@@ -405,10 +431,35 @@ where
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         // only report a received frame if a tx buffer will also be available (see paired-token
         // note: smoltcp always wants both, so this doubles as the anti-deadlock guard)
-        todo!()
+        if self.rx_ready_consumer.is_empty() {
+            return None;
+        }
+        // TODO check if box can be created as well
+        if !self.tx_ready_producer.ready() {
+            return None;
+        }
+
+        // safety: we have already checked that the rx_ready_consumer is not empty, so dequeue is safe
+        let rx_frame = self.rx_ready_consumer.dequeue().unwrap();
+        let rx_token = TC6DriverRxToken { frame: rx_frame };
+
+        // TODO make sure the compiler is smart and avoids a hugely expensive copy/move of the FrameBuffer struct here, since it is a large array. It should be optimized away by the compiler, but we should check.
+        let tx_frame = TxP::alloc(FrameBuffer::new()).unwrap();
+        let tx_token = TC6DriverTxToken {
+            frame: tx_frame,
+            queue: &mut self.tx_ready_producer,
+        };
+        Some((rx_token, tx_token))
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        todo!()
+        if !self.tx_ready_producer.ready() {
+            return None;
+        }
+        let tx_frame = TxP::alloc(FrameBuffer::new()).unwrap();
+        Some(TC6DriverTxToken {
+            frame: tx_frame,
+            queue: &mut self.tx_ready_producer,
+        })
     }
 }

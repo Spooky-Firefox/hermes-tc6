@@ -16,10 +16,6 @@ pub mod tc6_footer;
 pub mod tc6_header;
 #[cfg(test)]
 mod tests {
-    use std::vec;
-
-    use super::*;
-
     #[test]
     fn it_works() {
         let result = 2 + 2;

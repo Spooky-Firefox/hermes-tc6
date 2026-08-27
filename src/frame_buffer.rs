@@ -1,4 +1,5 @@
 use core::mem::MaybeUninit;
+#[derive(Debug)]
 pub struct FrameBuffer<const M: usize> {
     start: usize,
     len: usize,
