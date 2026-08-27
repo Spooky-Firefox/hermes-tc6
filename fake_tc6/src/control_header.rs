@@ -91,14 +91,18 @@ impl ControlHeader {
     }
 
     fn calc_parity_bit(&self) -> bool {
-        self.dnc as u32
+        // odd parity: the parity bit is set so the total number of 1 bits (header + parity)
+        // is odd, i.e. it is 1 when the data bits contain an even number of 1s.
+        // NOTE: `%` binds tighter than `+`, so the whole sum must be parenthesised before `% 2`.
+        (self.dnc as u32
             + self.hdrb as u32
             + self.wnr as u32
             + self.aid as u32
             + self.mms.count_ones()
             + ((self.addr >> 8) as u8).count_ones()
             + (self.addr as u8).count_ones()
-            + self.len.count_ones() % 2
+            + self.len.count_ones())
+            % 2
             == 0
     }
 

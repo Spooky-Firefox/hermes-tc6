@@ -51,7 +51,7 @@ impl<const M: usize> FrameBuffer<M> {
     /// View the initialized portion as a normal &[u8].
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: bytes in [start, start+len) are guaranteed initialized
-        // by the write_at/len invariant.
+        // by the get_mut_at_end/add_len invariant.
         unsafe {
             let ptr = self.buffer.as_ptr().add(self.start) as *const u8;
             core::slice::from_raw_parts(ptr, self.len)
@@ -60,7 +60,7 @@ impl<const M: usize> FrameBuffer<M> {
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: bytes in [start, start+len) are guaranteed initialized
-        // by the write_at/len invariant.
+        // by the get_mut_at_end/add_len invariant.
         unsafe {
             let ptr = self.buffer.as_mut_ptr().add(self.start) as *mut u8;
             core::slice::from_raw_parts_mut(ptr, self.len)

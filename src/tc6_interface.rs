@@ -1,10 +1,10 @@
 use embedded_dma::{ReadBuffer, WriteBuffer};
 
-/// SAFETY: The implementor must ensure that when drop any ongoing DMA transfers are completed or aborted before the implementor is dropped. This is to ensure that the DMA transfer does not access invalid memory after the implementor is dropped.
+/// SAFETY: The implementor must ensure that when dropped, any ongoing DMA transfers are completed or aborted before the implementor is dropped. This is to ensure that the DMA transfer does not access invalid memory after the implementor is dropped.
 pub trait Tc6Interface {
     type Error;
     // Todo add error type
-    /// This function send a block of data to the TC6 device and populates the result buffer with the response
+    /// This function sends a block of data to the TC6 device and populates the result buffer with the response
     fn begin_send_block(
         &mut self,
         header: u32,
@@ -30,7 +30,14 @@ pub trait Tc6Interface {
             "data and result buffers must be the same length"
         );
 
-        let header = unsafe { *data.0.cast::<u32>() };
+        // The first 4 bytes hold the header as big-endian bytes (see the driver, which writes
+        // `header.raw().to_be_bytes()`). Read it back byte-wise: `data.0` is only `u8`-aligned,
+        // so `*data.0.cast::<u32>()` would be an unaligned read, and a plain cast would also pick
+        // up the host's native endianness instead of the wire's.
+        let header_bytes: &[u8; 4] = unsafe { core::slice::from_raw_parts(data.0, 4) }
+            .try_into()
+            .unwrap();
+        let header = u32::from_be_bytes(*header_bytes);
         let data_block: &[u8; 64] = unsafe { core::slice::from_raw_parts(data.0.add(4), 64) }
             .try_into()
             .unwrap();

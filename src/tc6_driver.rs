@@ -176,7 +176,7 @@ where
                 self.current_receive_buffer.as_mut(),
             ) {
                 // read the footer
-                // Safety, before this function can be called, we have started a block send, and transferred is complete have passed,
+                // Safety: before this function can be called, we have started a block send and the transfer has completed,
                 // so the tc6 chip should have populated the 68 bytes at the end of the receive frame
                 // that we sent in handle idle, so we can read the footer from the receive frame
                 unsafe { receive_frame.get_mut_at_end(68) }
@@ -185,7 +185,7 @@ where
                 &mut self.scratch_buffer
             } else if let Some(receive_frame) = self.current_receive_buffer.as_mut() {
                 // read the footer
-                // Safety, before this function can be called, we have started a block send, and transferred is complete have passed,
+                // Safety: before this function can be called, we have started a block send and the transfer has completed,
                 // so the tc6 chip should have populated the 68 bytes at the end of the receive frame
                 // that we sent in handle idle, so we can read the footer from the receive frame
                 unsafe { receive_frame.get_mut_at_end(68) }
@@ -231,7 +231,7 @@ where
             }
         } else {
             if footer.ev() && footer.sv() {
-                // if for some reson a new frame is started before the previous one is finished, we will panic, as this should not happen
+                // if for some reason a new frame is started before the previous one is finished, we will panic, as this should not happen
                 assert!(footer.ebo() < footer.swo() * 4);
             }
             // note this is only valid if ev is set
@@ -253,7 +253,7 @@ where
                 frame_done = true;
                 self.current_receive_buffer = None;
             } else {
-                // dv is set, but ev and sv not set so whole block is valid and its ok to add the whole block to the receive frame
+                // dv is set, but ev and sv not set so whole block is valid and it's ok to add the whole block to the receive frame
                 unsafe { receive_frame.add_len(64) }
                 frame_done = false;
             }
@@ -333,12 +333,12 @@ where
                 self.driver_state = TC6DriverState::WaitingForTransmitComplete;
             } else {
                 // todo
-                // update swap header with transmit_buff cursor -4 to allow for sending the header and data in one go, save to overwritten data to scratch header.
+                // update swap header with transmit_buff cursor -4 to allow for sending the header and data in one go, save the overwritten data to the scratch header.
             }
         } else if let Some(f) = self.current_receive_buffer.as_mut() {
             // irq fired, we have data to be read
             let mut header = tc6_header::TransmitHeader::new();
-            // we dont have any data to send, so dv = 0
+            // we don't have any data to send, so dv = 0
             header = header.with_dv(false);
             self.scratch_buffer[0..4].copy_from_slice(&header.raw().to_be_bytes());
             let data = DMAPtr::from_slice(&mut self.scratch_buffer);
@@ -388,7 +388,7 @@ where
         F: FnOnce(&mut [u8]) -> R,
     {
         let TC6DriverTxToken { mut frame, queue } = self;
-        // sayfty we say that this is intilized, as we assume that FnOnce will write to the buffer
+        // safety: we say that this is initialized, as we assume that FnOnce will write to the buffer
         let r = unsafe {
             frame.add_len(len);
             f(frame.as_mut_slice())
@@ -419,7 +419,7 @@ where
         let mut cap = DeviceCapabilities::default();
         cap.medium = smoltcp::phy::Medium::Ethernet;
         cap.max_burst_size = Some(NQ);
-        // set default checksum capabilities, which is calculate and verify by software (TODO find out if this is the case, and that i have not mixed it up)
+        // set default checksum capabilities, which is calculated and verified by software (TODO find out if this is the case, and that i have not mixed it up)
         cap.checksum = smoltcp::phy::ChecksumCapabilities::default();
         cap.max_transmission_unit = M; //TODO actually determine what the correct MTU should be for a ethernet frame
         cap

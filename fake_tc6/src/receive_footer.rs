@@ -189,7 +189,10 @@ impl ReceiveFooter {
     }
 
     fn calc_parity_bit(&self) -> bool {
-        self.exst as u32
+        // odd parity: the parity bit is set so the total number of 1 bits (footer + parity)
+        // is odd, i.e. it is 1 when the data bits contain an even number of 1s.
+        // NOTE: `%` binds tighter than `+`, so the whole sum must be parenthesised before `% 2`.
+        (self.exst as u32
             + self.hdrb as u32
             + self.sync as u32
             + self.rca.count_ones()
@@ -201,7 +204,8 @@ impl ReceiveFooter {
             + self.ebo.count_ones()
             + self.rtsa as u32
             + self.rtsp as u32
-            + self.txc.count_ones() % 2
+            + self.txc.count_ones())
+            % 2
             == 0
     }
 

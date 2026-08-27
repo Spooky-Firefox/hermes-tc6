@@ -142,7 +142,10 @@ impl TransmitHeader {
     }
 
     fn calc_parity_bit(&self) -> bool {
-        self.dnc as u32
+        // odd parity: the parity bit is set so the total number of 1 bits (header + parity)
+        // is odd, i.e. it is 1 when the data bits contain an even number of 1s.
+        // NOTE: `%` binds tighter than `+`, so the whole sum must be parenthesised before `% 2`.
+        (self.dnc as u32
             + self.seq as u32
             + self.norx as u32
             + self.dv as u32
@@ -150,7 +153,8 @@ impl TransmitHeader {
             + self.swo.count_ones()
             + self.ev as u32
             + self.ebo.count_ones()
-            + self.tsc.count_ones() % 2
+            + self.tsc.count_ones())
+            % 2
             == 0
     }
 
@@ -200,7 +204,7 @@ mod test {
     #[test]
     fn parity_test() {
         let mut header = TransmitHeader::default();
-        // bit should be true, so there is a odd number of bits
+        // bit should be true, so there is an odd number of bits
         assert!(header.calc_parity_bit());
 
         header.dnc = true;
@@ -222,12 +226,12 @@ mod test {
         assert!(header.valid());
 
         header.swo = 0b11;
-        // header not valid since swo is something and SV is not set, party is the same since we added 2 bits
+        // header not valid since swo is something and SV is not set, parity is the same since we added 2 bits
         assert!(!header.valid());
 
         header.swo = 0b111;
         header.sv = true;
-        // not valid since dw is not set
+        // not valid since dv is not set
         assert!(!header.valid());
 
         header.dv = true;

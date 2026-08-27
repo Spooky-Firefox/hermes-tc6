@@ -101,7 +101,7 @@ impl FakeTc6Device {
         }
     }
 
-    // this is ment to enqueue a frame to be sent to the host, it will be sent in the next block that is read from the device
+    // this is meant to enqueue a frame to be sent to the host, it will be sent in the next block that is read from the device
     pub fn enqueue_receive_frame(&mut self, frame: Vec<u8>) {
         self.receive_buff.push(frame);
     }
@@ -185,7 +185,7 @@ impl FakeTc6Device {
             ) {
                 // sv and ev are not set, data section is entire block
                 (false, false, _) => {
-                    // safe to push, we need to had a sv before this can occur, some one need to have pushed an empty vec
+                    // safe to push: we must have had an sv before this can occur, so someone must have pushed an empty vec
                     self.transmit_buff.last_mut().unwrap().push(byte);
                 }
                 // sv is set and ev is not set, data section is from swo*4 to end of block
@@ -194,14 +194,14 @@ impl FakeTc6Device {
                         self.transmit_buff.push(vec![]);
                     }
                     if i >= self.transmit_header.swo as usize * 4 {
-                        // safe to push, we need to had a sv before this can occur, some one need to have pushed an empty vec
+                        // safe to push: we must have had an sv before this can occur, so someone must have pushed an empty vec
                         self.transmit_buff.last_mut().unwrap().push(byte);
                     }
                 }
                 // sv is not set and ev is set, data section is from start of block to ebo
                 (false, true, _) => {
                     if i <= self.transmit_header.ebo as usize {
-                        // safe to push, we need to had a sv before this can occur, some one need to have pushed an empty vec
+                        // safe to push: we must have had an sv before this can occur, so someone must have pushed an empty vec
                         self.transmit_buff.last_mut().unwrap().push(byte);
                     }
                 }
@@ -213,7 +213,7 @@ impl FakeTc6Device {
                     if i >= self.transmit_header.swo as usize * 4
                         && i <= self.transmit_header.ebo as usize
                     {
-                        // safe to push, we need to had a sv before this can occur, some one need to have pushed an empty vec
+                        // safe to push: we must have had an sv before this can occur, so someone must have pushed an empty vec
                         self.transmit_buff.last_mut().unwrap().push(byte);
                     }
                 }
@@ -228,11 +228,11 @@ impl FakeTc6Device {
                     }
 
                     if i <= self.transmit_header.ebo as usize {
-                        // safe to push, we need to had a sv before this can occur, some one need to have pushed an empty vec
+                        // safe to push: we must have had an sv before this can occur, so someone must have pushed an empty vec
                         self.transmit_buff.last_mut().unwrap().push(byte);
                     }
                     if i >= self.transmit_header.swo as usize * 4 {
-                        // safe to push, we need to had a sv before this can occur, some one need to have pushed an empty vec
+                        // safe to push: we must have had an sv before this can occur, so someone must have pushed an empty vec
                         self.transmit_buff.last_mut().unwrap().push(byte);
                     }
                 }
@@ -254,7 +254,7 @@ impl FakeTc6Device {
         };
 
         if i == self.block_size - 1 {
-            // header indicates host listend, inc offset so next block contains
+            // header indicates host listened, inc offset so next block contains
             self.mode = ReadingHeader(0)
         } else {
             self.mode = ReadingWritingBlock(i + 1);
@@ -284,12 +284,12 @@ impl FakeTc6Device {
         Ok(out)
     }
 
-    /// this functions returns the byte that should be sent on the MISO line when the master is reading from the device. (in data mode, not command mode)
-    /// if there exist valid data to be written, it will set the dv in the footer.
-    /// and it will also set the start word offset to the first byte of the frame that have data (condition, index + offset == 0)
-    /// end byte will also be set to the last byte of the frame that have data (condition, index + offset == receive_buff.first().len() - 1)
-    /// if a frame have been sent, it will be removed from the receive_buff and the offset will be updated
-    /// if block is done it will uppdate offset so next block will start at the correct offset, if not norx
+    /// this function returns the byte that should be sent on the MISO line when the master is reading from the device. (in data mode, not command mode)
+    /// if there exists valid data to be written, it will set the dv in the footer.
+    /// and it will also set the start word offset to the first byte of the frame that has data (condition, index + offset == 0)
+    /// end byte will also be set to the last byte of the frame that has data (condition, index + offset == receive_buff.first().len() - 1)
+    /// if a frame has been sent, it will be removed from the receive_buff and the offset will be updated
+    /// if the block is done it will update the offset so the next block will start at the correct offset, if not norx
     fn get_out_byte_from_receive_buff(&mut self) -> u8 {
         // norx means the host will ignore this chunk's payload; footer must stay all-zero and
         // no state (word_offset, receive_buff) may change so the same data is resent next chunk.
@@ -332,14 +332,14 @@ impl FakeTc6Device {
             // has deliberately been delayed to later in this block (e.g. to exercise host-side mid-block
             // frame-start reception in tests), and that pending frame must not be skipped by popping again
             // before its start byte has actually been reached.
-            // if we have already had a start of a frame, we shuld not begin a new frame, as we can only send a signle start per block
+            // if we have already had a start of a frame, we should not begin a new frame, as we can only send a single start per block
             if index % 4 == 0
                 && self.word_offset > 0
                 && !self.receive_footer.sv
                 && !self.receive_buff.is_empty()
             {
                 self.receive_buff.remove(0);
-                // assume we are at index 7, the last byte of the second word, we have already sent sent al bytes of the frame,
+                // assume we are at index 7, the last byte of the second word, we have already sent all bytes of the frame,
                 // the later first_mut will send zero.
                 // we now go to the next byte, byte 8, the first byte of the third.
                 // we need to set the offset to -2, so that the first_mut will send the first byte of the next frame.
@@ -393,10 +393,10 @@ impl Default for FakeTc6Device {
 
 #[derive(Clone, Debug)]
 pub enum Mode {
-    // reading the the header, the u represents how many bytes have been read
+    // reading the header, the value represents how many bytes have been read
     ReadingHeader(usize),
     ReadingWritingBlock(usize),
-    // echo command, the u32 represents how many bytes have been sent/read
+    // echo command, the value represents how many bytes have been sent/read
     Command(usize),
     ReadingCommandHeader(usize),
 }
