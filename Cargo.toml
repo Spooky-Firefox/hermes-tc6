@@ -3,6 +3,9 @@ name = "hermes-tc6"
 version = "0.1.0"
 edition = "2024"
 
+[dev-dependencies]
+fake_tc6 = { path = "fake_tc6" }
+
 [dependencies]
 embedded-dma = "0.2.0"
 embedded-hal = "1.0.0"

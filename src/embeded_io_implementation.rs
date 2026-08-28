@@ -6,6 +6,21 @@ pub struct EmbeddedHalImplementation<T: SpiDevice> {
     inner: T,
 }
 
+impl<T: SpiDevice> EmbeddedHalImplementation<T> {
+    pub fn new(inner: T) -> Self {
+        Self { inner }
+    }
+
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddedHalImplementationError<T> {
     SpiError(T),
     BufferSizeMismatch,

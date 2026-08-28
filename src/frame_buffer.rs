@@ -23,6 +23,22 @@ impl<const M: usize> FrameBuffer<M> {
         unsafe { core::slice::from_raw_parts_mut(ptr, len) }
     }
 
+    /// Mutable view of `len` bytes starting at absolute buffer index `index`.
+    ///
+    /// Like [`get_mut_at_end`](Self::get_mut_at_end), the range is allowed to run past the
+    /// initialized region (`start + len`) into spare capacity, so it is bounded only by the
+    /// total capacity `M`. Bytes beyond `start + len` must not be read as initialized.
+    ///
+    /// Used by the multi-block transmit path, which hands the interface a window that starts
+    /// 4 bytes *before* the send cursor (room for the chunk header) and runs one 64-byte
+    /// block past it - the tail of that window may sit in not-yet-written frame bytes on the
+    /// final, partial block.
+    pub unsafe fn get_mut_at_index(&mut self, index: usize, len: usize) -> &mut [u8] {
+        assert!(index + len <= M);
+        let ptr = unsafe { self.buffer.as_mut_ptr().add(index) } as *mut u8;
+        unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+    }
+
     pub unsafe fn add_len(&mut self, len: usize) {
         let end = self.start + self.len;
         assert!(end + len <= M);
