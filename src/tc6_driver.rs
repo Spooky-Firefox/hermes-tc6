@@ -1,6 +1,6 @@
 use crate::tc6_footer::ReceiveFooter;
 use crate::tc6_interface::Tc6Interface;
-use crate::{frame_buffer::FrameBuffer, tc6_footer, tc6_header};
+use crate::{frame_buffer::FrameBuffer, registers, tc6_footer, tc6_header};
 use embedded_dma::{ReadBuffer, WriteBuffer};
 use heapless::pool::boxed::{Box, BoxPool};
 use heapless::spsc::{Consumer, Producer, Queue};
@@ -118,6 +118,100 @@ impl ControlResult {
     }
 }
 
+/// `CONFIG0.TXCTHRESH` - minimum free transmit credits before the chip asserts IRQn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TxCreditThreshold {
+    /// >= 1 credit (reset default).
+    #[default]
+    One,
+    /// >= 4 credits.
+    Four,
+    /// >= 8 credits.
+    Eight,
+    /// >= 16 credits.
+    Sixteen,
+}
+
+impl TxCreditThreshold {
+    const fn bits(self) -> u8 {
+        match self {
+            TxCreditThreshold::One => 0b00,
+            TxCreditThreshold::Four => 0b01,
+            TxCreditThreshold::Eight => 0b10,
+            TxCreditThreshold::Sixteen => 0b11,
+        }
+    }
+}
+
+/// Frame timestamp width, selected by `CONFIG0.FTSS` when timestamps are enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampSize {
+    Bits32,
+    Bits64,
+}
+
+/// Bring-up configuration applied by [`TC6HighPrio::configure`] / [`split_configured`].
+///
+/// [`Config::default`] is the minimal safe setup: unprotected control, >= 1 transmit credit
+/// before IRQn, no cut-through, no timestamps, every maskable interrupt masked. The chunk
+/// payload size is always forced to 64 bytes - the data path assumes it.
+#[derive(Debug, Clone, Copy)]
+pub struct Config {
+    /// `CONFIG0.PROTE` - transfer each control word with its complement for error detection.
+    pub protected: bool,
+    /// `CONFIG0.TXCTHRESH`.
+    pub tx_credit_threshold: TxCreditThreshold,
+    /// `CONFIG0.TXCTE` - cut-through from the SPI host to the network. Requires `STDCAP.CTC`.
+    pub cut_through_tx: bool,
+    /// `CONFIG0.RXCTE` - cut-through from the network to the SPI host. Requires `STDCAP.CTC`.
+    pub cut_through_rx: bool,
+    /// `Some` enables `CONFIG0.FTSE` and picks the width via `FTSS`. Requires `STDCAP.FTSC`.
+    pub timestamp: Option<TimestampSize>,
+    /// Value written to `IMASK0`. Defaults to [`registers::IMask0::RESET_VALUE`].
+    pub interrupt_mask: registers::IMask0,
+    /// Max busy-wait iterations for a single control transfer to report complete before
+    /// [`configure`](TC6HighPrio::configure) gives up with [`ConfigError::Timeout`].
+    pub transfer_poll_limit: u32,
+    /// Max `STATUS0` re-reads waiting for `RESETC` before [`ConfigError::ResetNotComplete`].
+    pub reset_poll_limit: u32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            protected: false,
+            tx_credit_threshold: TxCreditThreshold::One,
+            cut_through_tx: false,
+            cut_through_rx: false,
+            timestamp: None,
+            interrupt_mask: registers::IMask0::RESET_VALUE,
+            transfer_poll_limit: 100_000,
+            reset_poll_limit: 64,
+        }
+    }
+}
+
+/// Error from [`TC6HighPrio::configure`] / [`split_configured`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigError<E> {
+    /// A control transaction was already pending/in flight when `configure` was called.
+    Busy,
+    /// A control transfer never reported complete within `Config::transfer_poll_limit`.
+    Timeout,
+    /// `STATUS0.RESETC` never became set within `Config::reset_poll_limit` reads.
+    ResetNotComplete,
+    /// `IDVER` read back implausible - the bus is not working or this is not a TC6 device.
+    BadVersion { major: u8, minor: u8 },
+    /// A requested feature is not advertised in `STDCAP` (the `&str` names it).
+    Unsupported(&'static str),
+    /// `CONFIG0` read-back did not show `SYNC` set with a 64-byte chunk payload.
+    SyncFailed,
+    /// The MAC-PHY rejected a control command header (parity error / HDRB).
+    HeaderRejected,
+    /// The underlying interface failed to run a transfer.
+    Interface(E),
+}
+
 /// Implemented by the application to wake the high-priority side when the low-priority side has
 /// queued a frame to transmit (e.g. pend a software interrupt, or spawn an RTIC task that ends up
 /// calling `TC6HighPrio::on_transmit_ready`). Without this, a pure-transmit workload would never
@@ -150,6 +244,9 @@ where
     last_control_result: Option<ControlResult>, // completed transaction, waiting to be taken
     control_tx_buffer: [u8; CONTROL_BUF_LEN],   // MOSI: header + write data + trailing don't-care
     control_rx_buffer: [u8; CONTROL_BUF_LEN],   // MISO: don't-care + echoed header + data
+    // Set by `configure`; cleared if a receive footer ever reports SYNC = 0 (the chip reset
+    // itself and lost its configuration, spec Section 7.7 - the host must re-run `configure`).
+    sync_established: bool,
 }
 
 /// Owned by the low-priority context (e.g. `idle`): implements `smoltcp::phy::Device`.
@@ -203,6 +300,7 @@ where
             last_control_result: None,
             control_tx_buffer: [0; CONTROL_BUF_LEN],
             control_rx_buffer: [0; CONTROL_BUF_LEN],
+            sync_established: false,
         },
         TC6LowPrio {
             rx_ready_consumer,
@@ -210,6 +308,34 @@ where
             transmit_signal,
         },
     )
+}
+
+/// Like [`split`], then run [`TC6HighPrio::configure`] on the high-priority half before handing
+/// both back, so the caller can never obtain an unconfigured driver. On error the driver halves
+/// are dropped; there is nothing useful to do with them.
+#[allow(clippy::type_complexity)]
+pub fn split_configured<T, RxP, TxP, S, const M: usize, const NQ: usize>(
+    interface: T,
+    rx_ready: &'static mut Queue<Box<RxP>, NQ>,
+    tx_ready: &'static mut Queue<Box<TxP>, NQ>,
+    transmit_signal: S,
+    config: &Config,
+) -> Result<
+    (
+        TC6HighPrio<T, RxP, TxP, M, NQ>,
+        TC6LowPrio<RxP, TxP, S, M, NQ>,
+    ),
+    ConfigError<T::Error>,
+>
+where
+    T: Tc6Interface,
+    RxP: BoxPool<Data = FrameBuffer<M>> + 'static,
+    TxP: BoxPool<Data = FrameBuffer<M>> + 'static,
+    S: TransmitSignal,
+{
+    let (mut hi, lo) = split(interface, rx_ready, tx_ready, transmit_signal);
+    hi.configure(config)?;
+    Ok((hi, lo))
 }
 
 impl<T, RxP, TxP, const M: usize, const NQ: usize> TC6HighPrio<T, RxP, TxP, M, NQ>
@@ -313,6 +439,11 @@ where
             }
 
             footer = tc6_footer::ReceiveFooter::from_bytes(bytes[64..68].try_into().unwrap());
+        }
+        // Every receive footer mirrors CONFIG0.SYNC. Losing it after bring-up means the chip
+        // reset itself; flag that the host needs to re-run `configure` (spec Section 7.7).
+        if self.sync_established && !footer.sync() {
+            self.sync_established = false;
         }
         if footer.dv() {
             self.handle_data_valid(footer)?;
@@ -657,6 +788,213 @@ where
         self.driver_state = TC6DriverState::Idle;
         Ok(())
     }
+
+    // --- blocking bring-up (register configuration, spec Sections 7.6 / 9.2) ---
+
+    /// `true` once [`configure`](Self::configure) has driven `CONFIG0.SYNC = 1` and no receive
+    /// footer has since reported `SYNC = 0`. While this is `false` the MAC-PHY ignores transmit
+    /// data chunks and delivers no receive frames.
+    pub fn is_configured(&self) -> bool {
+        self.sync_established
+    }
+
+    /// Run the mandatory bring-up sequence, busy-polling each control transfer to completion:
+    ///
+    /// 1. wait for `STATUS0.RESETC` (reset complete),
+    /// 2. sanity-check `IDVER`,
+    /// 3. gate requested features on `STDCAP`,
+    /// 4. write `CONFIG0` with a 64-byte chunk payload and `SYNC = 1`,
+    /// 5. read `CONFIG0` back and confirm `SYNC` stuck,
+    /// 6. program `IMASK0`,
+    /// 7. clear latched `STATUS0` bits (including `RESETC`).
+    ///
+    /// Call this from init (or after a footer reports `SYNC = 0`) *before* servicing data
+    /// traffic. It only touches control registers - the frame queues are untouched - and it
+    /// polls [`Tc6Interface::transfer_complete`] directly, so it does not need an interrupt
+    /// source wired up yet. On [`ConfigError::Timeout`] the state machine is returned to idle,
+    /// but a genuinely stuck transfer may still be running on the interface.
+    pub fn configure(&mut self, cfg: &Config) -> Result<(), ConfigError<T::Error>> {
+        use registers::{addr, mms, Config0, IdVer, Status0, StdCap};
+
+        if self.control_busy() {
+            return Err(ConfigError::Busy);
+        }
+
+        // 1. reset complete?
+        let mut tries = 0u32;
+        loop {
+            let s0 = Status0::from_raw(self.read_reg_blocking(
+                mms::STANDARD,
+                addr::STATUS0,
+                cfg.transfer_poll_limit,
+            )?);
+            if s0.resetc() {
+                break;
+            }
+            tries += 1;
+            if tries >= cfg.reset_poll_limit {
+                return Err(ConfigError::ResetNotComplete);
+            }
+        }
+
+        // 2. is anyone home?
+        let id = IdVer::from_raw(self.read_reg_blocking(
+            mms::STANDARD,
+            addr::IDVER,
+            cfg.transfer_poll_limit,
+        )?);
+        if id.majver() == 0 {
+            return Err(ConfigError::BadVersion {
+                major: id.majver(),
+                minor: id.minver(),
+            });
+        }
+
+        // 3. capability gating
+        let cap = StdCap::from_raw(self.read_reg_blocking(
+            mms::STANDARD,
+            addr::STDCAP,
+            cfg.transfer_poll_limit,
+        )?);
+        if (cfg.cut_through_tx || cfg.cut_through_rx) && !cap.ctc() {
+            return Err(ConfigError::Unsupported("cut-through"));
+        }
+        if cfg.timestamp.is_some() && !cap.ftsc() {
+            return Err(ConfigError::Unsupported("frame timestamp"));
+        }
+
+        // 4. write CONFIG0 with the driver's required 64-byte chunk payload and SYNC = 1
+        let mut c0 = Config0::from_raw(0)
+            .with_cps(6) // 2^6 = 64-byte data chunk payload
+            .with_prote(cfg.protected)
+            .with_txcte(cfg.cut_through_tx)
+            .with_rxcte(cfg.cut_through_rx)
+            .with_txcthresh(cfg.tx_credit_threshold.bits());
+        if let Some(size) = cfg.timestamp {
+            c0 = c0
+                .with_ftse(true)
+                .with_ftss(matches!(size, TimestampSize::Bits64));
+        }
+        c0 = c0.with_sync(true);
+        self.write_reg_blocking(
+            mms::STANDARD,
+            addr::CONFIG0,
+            c0.raw(),
+            cfg.transfer_poll_limit,
+        )?;
+
+        // 5. confirm SYNC stuck (spec 7.6: once set it cannot be written back to 0)
+        let readback = Config0::from_raw(self.read_reg_blocking(
+            mms::STANDARD,
+            addr::CONFIG0,
+            cfg.transfer_poll_limit,
+        )?);
+        if !readback.sync() || readback.cps() != 6 {
+            return Err(ConfigError::SyncFailed);
+        }
+
+        // 6. interrupt mask
+        self.write_reg_blocking(
+            mms::STANDARD,
+            addr::IMASK0,
+            cfg.interrupt_mask.raw(),
+            cfg.transfer_poll_limit,
+        )?;
+
+        // 7. clear RESETC and any latched errors
+        self.write_reg_blocking(
+            mms::STANDARD,
+            addr::STATUS0,
+            Status0::clear_all().raw(),
+            cfg.transfer_poll_limit,
+        )?;
+
+        self.sync_established = true;
+        Ok(())
+    }
+
+    fn read_reg_blocking(
+        &mut self,
+        mms: u8,
+        addr: u16,
+        poll_limit: u32,
+    ) -> Result<u32, ConfigError<T::Error>> {
+        let res = self.run_control_blocking(
+            PendingControl {
+                write: false,
+                mms,
+                addr,
+                count: 1,
+                values: [0; CONTROL_MAX_REGS],
+            },
+            poll_limit,
+        )?;
+        if res.header_bad {
+            return Err(ConfigError::HeaderRejected);
+        }
+        Ok(res.values()[0])
+    }
+
+    fn write_reg_blocking(
+        &mut self,
+        mms: u8,
+        addr: u16,
+        value: u32,
+        poll_limit: u32,
+    ) -> Result<(), ConfigError<T::Error>> {
+        let mut values = [0; CONTROL_MAX_REGS];
+        values[0] = value;
+        let res = self.run_control_blocking(
+            PendingControl {
+                write: true,
+                mms,
+                addr,
+                count: 1,
+                values,
+            },
+            poll_limit,
+        )?;
+        if res.header_bad {
+            return Err(ConfigError::HeaderRejected);
+        }
+        Ok(())
+    }
+
+    /// Issue one control transaction and spin on [`Tc6Interface::transfer_complete`] until it
+    /// finishes or `poll_limit` iterations elapse. Never enters the data path.
+    fn run_control_blocking(
+        &mut self,
+        req: PendingControl,
+        poll_limit: u32,
+    ) -> Result<ControlResult, ConfigError<T::Error>> {
+        debug_assert!(!self.control_busy(), "run_control_blocking while busy");
+        self.pending_control = Some(req);
+        self.start_control_transaction()
+            .map_err(ConfigError::Interface)?;
+
+        let mut spins = 0u32;
+        loop {
+            if self
+                .interface
+                .transfer_complete()
+                .map_err(ConfigError::Interface)?
+            {
+                self.handle_control_complete()
+                    .map_err(ConfigError::Interface)?;
+                return Ok(self
+                    .last_control_result
+                    .take()
+                    .expect("handle_control_complete stores a result"));
+            }
+            spins += 1;
+            if spins >= poll_limit {
+                // don't leave the state machine wedged in WaitingForControlComplete
+                self.control_in_flight = None;
+                self.driver_state = TC6DriverState::Idle;
+                return Err(ConfigError::Timeout);
+            }
+        }
+    }
 }
 
 pub struct TC6DriverRxToken<RxP: BoxPool> {
@@ -804,6 +1142,7 @@ mod driver_tests {
     use heapless::pool::boxed::BoxBlock;
     use smoltcp::phy::{Device, Medium, RxToken, TxToken};
     use smoltcp::time::Instant;
+    use std::collections::BTreeMap;
     use std::vec::Vec;
 
     const M: usize = 1536; // FrameBuffer capacity (bytes)
@@ -1091,6 +1430,126 @@ mod driver_tests {
         }
     }
 
+    /// A tiny MMS-0 register file that answers control transactions inline (synchronously),
+    /// which is what the blocking `configure` path needs. Models just enough of the standard
+    /// registers for bring-up: RO IDVER/PHYID/STDCAP, sticky `CONFIG0.SYNC`, W1C `STATUS0`.
+    struct RegDouble {
+        regs: BTreeMap<(u8, u16), u32>,
+        writes: Vec<(u8, u16, u32)>,
+        /// drop the `SYNC` bit on every `CONFIG0` write (to exercise `ConfigError::SyncFailed`)
+        ignore_sync_write: bool,
+        /// never raise completion (to exercise `ConfigError::Timeout`)
+        never_complete: bool,
+        complete: bool,
+    }
+
+    impl RegDouble {
+        fn new() -> Self {
+            let mut regs = BTreeMap::new();
+            regs.insert((0, 0x0000), 0x0000_0011); // IDVER: v1.1
+            regs.insert((0, 0x0002), 0x0000_00C6); // STDCAP: CTC | FTSC | MINCPS=6
+            regs.insert((0, 0x0004), 0x0000_0006); // CONFIG0: CPS=6, SYNC=0
+            regs.insert((0, 0x0008), 0x0000_0040); // STATUS0: RESETC set
+            regs.insert((0, 0x000C), 0x0000_1FBF); // IMASK0: reset value
+            Self {
+                regs,
+                writes: Vec::new(),
+                ignore_sync_write: false,
+                never_complete: false,
+                complete: false,
+            }
+        }
+
+        fn reg(&self, mms: u8, addr: u16) -> u32 {
+            self.regs.get(&(mms, addr)).copied().unwrap_or(0)
+        }
+
+        fn apply_write(&mut self, mms: u8, addr: u16, val: u32) {
+            self.writes.push((mms, addr, val));
+            match (mms, addr) {
+                // read-only
+                (0, 0x0000) | (0, 0x0001) | (0, 0x0002) => {}
+                // STATUS0: write 1 to clear
+                (0, 0x0008) => {
+                    let cur = self.reg(0, 0x0008);
+                    self.regs.insert((0, 0x0008), cur & !val);
+                }
+                // CONFIG0: SYNC is sticky once set (spec 7.6)
+                (0, 0x0004) => {
+                    let cur = self.reg(0, 0x0004);
+                    let mut newv = val;
+                    if registers::Config0::from_raw(cur).sync() {
+                        newv |= 1 << 15;
+                    }
+                    if self.ignore_sync_write {
+                        newv &= !(1 << 15);
+                    }
+                    self.regs.insert((0, 0x0004), newv);
+                }
+                _ => {
+                    self.regs.insert((mms, addr), val);
+                }
+            }
+        }
+    }
+
+    impl Default for RegDouble {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Tc6Interface for RegDouble {
+        type Error = core::convert::Infallible;
+
+        fn begin_send_block(
+            &mut self,
+            _h: u32,
+            _d: impl ReadBuffer<Word = u8>,
+            _r: impl WriteBuffer<Word = u8>,
+        ) -> Result<(), Self::Error> {
+            unreachable!("RegDouble is only for control/bring-up tests")
+        }
+
+        fn transfer_complete(&mut self) -> Result<bool, Self::Error> {
+            Ok(core::mem::take(&mut self.complete))
+        }
+
+        fn begin_control_transaction(
+            &mut self,
+            tx: impl ReadBuffer<Word = u8>,
+            mut rx: impl WriteBuffer<Word = u8>,
+        ) -> Result<(), Self::Error> {
+            let (dptr, dlen) = unsafe { tx.read_buffer() };
+            let (rptr, rlen) = unsafe { rx.write_buffer() };
+            assert_eq!(dlen, rlen);
+            let txbuf = unsafe { core::slice::from_raw_parts(dptr, dlen) };
+            let rxbuf = unsafe { core::slice::from_raw_parts_mut(rptr, rlen) };
+
+            let hdr = tc6_header::ControlHeader::from_bytes(txbuf[0..4].try_into().unwrap());
+            let n = hdr.len() as usize + 1;
+
+            rxbuf.fill(0);
+            rxbuf[4..8].copy_from_slice(&txbuf[0..4]); // echo the command header
+            for i in 0..n {
+                let addr = hdr.addr() + i as u16;
+                let out = if hdr.wnr() {
+                    let val = u32::from_be_bytes(txbuf[4 + 4 * i..8 + 4 * i].try_into().unwrap());
+                    self.apply_write(hdr.mms(), addr, val);
+                    val // echo write data (spec 7.4.4)
+                } else {
+                    self.reg(hdr.mms(), addr)
+                };
+                rxbuf[8 + 4 * i..12 + 4 * i].copy_from_slice(&out.to_be_bytes());
+            }
+
+            if !self.never_complete {
+                self.complete = true;
+            }
+            Ok(())
+        }
+    }
+
     // --------------------------------------------------------------------------------------
     // environment setup
     // --------------------------------------------------------------------------------------
@@ -1112,6 +1571,25 @@ mod driver_tests {
                 ::std::boxed::Box::leak(::std::boxed::Box::new(Queue::new()));
             #[allow(unused_mut)]
             let (mut $hi, mut $lo) = split(($iface), rx_q, tx_q, ($signal));
+        };
+    }
+
+    /// Like [`setup!`] but goes through [`split_configured`], unwrapping the bring-up result.
+    macro_rules! setup_configured {
+        ($hi:ident, $lo:ident, $iface:expr, $signal:expr, $cfg:expr) => {
+            heapless::box_pool!(RxPool: FrameBuffer<M>);
+            heapless::box_pool!(TxPool: FrameBuffer<M>);
+            for _ in 0..8usize {
+                RxPool.manage(::std::boxed::Box::leak(::std::boxed::Box::new(BoxBlock::new())));
+                TxPool.manage(::std::boxed::Box::leak(::std::boxed::Box::new(BoxBlock::new())));
+            }
+            let rx_q: &'static mut Queue<Box<RxPool>, NQ> =
+                ::std::boxed::Box::leak(::std::boxed::Box::new(Queue::new()));
+            let tx_q: &'static mut Queue<Box<TxPool>, NQ> =
+                ::std::boxed::Box::leak(::std::boxed::Box::new(Queue::new()));
+            #[allow(unused_mut)]
+            let (mut $hi, mut $lo) = split_configured(($iface), rx_q, tx_q, ($signal), $cfg)
+                .expect("bring-up should succeed");
         };
     }
 
@@ -1913,5 +2391,158 @@ mod driver_tests {
         hi.on_transmit_ready().unwrap();
         assert_eq!(hi.interface.chunks.len(), 1);
         assert!(tc6_header::TransmitHeader::from_raw(hi.interface.chunks[0].header).dv());
+    }
+
+    // --------------------------------------------------------------------------------------
+    // blocking bring-up (configure / split_configured)
+    // --------------------------------------------------------------------------------------
+
+    /// The happy path: `configure` waits out RESETC, writes CONFIG0 with SYNC = 1 and a
+    /// 64-byte payload, programs IMASK0, and clears STATUS0.
+    #[test]
+    fn configure_runs_the_full_bring_up_sequence() {
+        setup!(hi, _lo, RegDouble::new(), NoopSignal);
+        assert!(!hi.is_configured());
+
+        hi.configure(&Config::default()).expect("bring-up ok");
+
+        assert!(hi.is_configured());
+        let c0 = registers::Config0::from_raw(hi.interface.reg(0, 0x0004));
+        assert!(c0.sync(), "SYNC written");
+        assert_eq!(c0.cps(), 6, "64-byte chunk payload forced");
+        assert_eq!(hi.interface.reg(0, 0x0008) & 0x40, 0, "RESETC cleared");
+        assert_eq!(
+            hi.interface.reg(0, 0x000C),
+            registers::IMask0::RESET_VALUE.raw(),
+            "IMASK0 programmed"
+        );
+        assert!(matches!(hi.driver_state, TC6DriverState::Idle));
+    }
+
+    #[test]
+    fn configure_applies_optional_features() {
+        setup!(hi, _lo, RegDouble::new(), NoopSignal);
+        let cfg = Config {
+            protected: true,
+            tx_credit_threshold: TxCreditThreshold::Eight,
+            cut_through_rx: true,
+            timestamp: Some(TimestampSize::Bits64),
+            ..Config::default()
+        };
+        hi.configure(&cfg).expect("bring-up ok");
+
+        let c0 = registers::Config0::from_raw(hi.interface.reg(0, 0x0004));
+        assert!(c0.prote());
+        assert!(c0.rxcte());
+        assert!(!c0.txcte());
+        assert_eq!(c0.txcthresh(), 0b10);
+        assert!(c0.ftse() && c0.ftss());
+        assert!(c0.sync());
+    }
+
+    #[test]
+    fn configure_rejects_cut_through_when_stdcap_lacks_it() {
+        setup!(hi, _lo, RegDouble::new(), NoopSignal);
+        hi.interface.regs.insert((0, 0x0002), 0x0000_0006); // STDCAP: MINCPS only, no CTC
+
+        let cfg = Config {
+            cut_through_rx: true,
+            ..Config::default()
+        };
+        assert!(matches!(
+            hi.configure(&cfg),
+            Err(ConfigError::Unsupported("cut-through"))
+        ));
+        assert!(!hi.is_configured());
+    }
+
+    #[test]
+    fn configure_times_out_waiting_for_reset_complete() {
+        setup!(hi, _lo, RegDouble::new(), NoopSignal);
+        hi.interface.regs.insert((0, 0x0008), 0x0000_0000); // RESETC never set
+
+        let cfg = Config {
+            reset_poll_limit: 3,
+            ..Config::default()
+        };
+        assert!(matches!(
+            hi.configure(&cfg),
+            Err(ConfigError::ResetNotComplete)
+        ));
+    }
+
+    #[test]
+    fn configure_rejects_implausible_version() {
+        setup!(hi, _lo, RegDouble::new(), NoopSignal);
+        hi.interface.regs.insert((0, 0x0000), 0);
+
+        assert!(matches!(
+            hi.configure(&Config::default()),
+            Err(ConfigError::BadVersion { major: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn configure_detects_sync_not_sticking() {
+        setup!(hi, _lo, RegDouble::new(), NoopSignal);
+        hi.interface.ignore_sync_write = true;
+
+        assert!(matches!(
+            hi.configure(&Config::default()),
+            Err(ConfigError::SyncFailed)
+        ));
+        assert!(!hi.is_configured());
+    }
+
+    #[test]
+    fn configure_times_out_on_a_stuck_transfer_and_unwedges() {
+        setup!(hi, _lo, RegDouble::new(), NoopSignal);
+        hi.interface.never_complete = true;
+
+        let cfg = Config {
+            transfer_poll_limit: 5,
+            ..Config::default()
+        };
+        assert!(matches!(hi.configure(&cfg), Err(ConfigError::Timeout)));
+        assert!(
+            matches!(hi.driver_state, TC6DriverState::Idle),
+            "state machine returned to idle after a timeout"
+        );
+        assert!(!hi.control_busy());
+    }
+
+    #[test]
+    fn split_configured_yields_a_ready_driver() {
+        setup_configured!(hi, _lo, RegDouble::new(), NoopSignal, &Config::default());
+        assert!(hi.is_configured());
+        assert!(registers::Config0::from_raw(hi.interface.reg(0, 0x0004)).sync());
+    }
+
+    /// A receive footer with SYNC = 0 after bring-up means the chip reset itself; the driver
+    /// drops its "configured" flag so the host knows to re-run `configure`.
+    #[test]
+    fn sync_loss_in_a_footer_clears_configured() {
+        setup!(hi, _lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true;
+
+        // a receive-only poll that comes back configured -> flag stays set
+        hi.handle_idle().unwrap();
+        hi.interface.respond(
+            &[],
+            crate::tc6_footer::ReceiveFooter::new()
+                .with_sync(true)
+                .with_correct_parity(),
+        );
+        hi.handle_transmit_complete().unwrap();
+        assert!(hi.is_configured());
+
+        // ...then one that reports SYNC = 0 -> flag cleared
+        hi.handle_idle().unwrap();
+        hi.interface.respond(
+            &[],
+            crate::tc6_footer::ReceiveFooter::new().with_correct_parity(),
+        );
+        hi.handle_transmit_complete().unwrap();
+        assert!(!hi.is_configured());
     }
 }
