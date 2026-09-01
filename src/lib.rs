@@ -3,8 +3,13 @@
 #[cfg(test)]
 extern crate std;
 
-/// TODO add feature for this and probably change module/file name to something better
-pub mod embeded_io_implementation;
+#[macro_use]
+mod fmt;
+
+/// Ready-made [`tc6_interface::Tc6Interface`] on top of a blocking `embedded-hal` SPI device.
+/// Gated behind the `embedded-hal` feature (on by default).
+#[cfg(feature = "embedded-hal")]
+pub mod embedded_io_implementation;
 
 pub mod tc6_interface;
 

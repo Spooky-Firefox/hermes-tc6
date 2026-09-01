@@ -321,6 +321,12 @@ where
     TxP: BoxPool<Data = FrameBuffer<M>> + 'static,
     S: TransmitSignal,
 {
+    debug!(
+        "tc6: split() - M={}, NQ={}, driver starts unconfigured",
+        M,
+        NQ
+    );
+
     let (rx_ready_producer, rx_ready_consumer) = rx_ready.split();
     let (tx_ready_producer, tx_ready_consumer) = tx_ready.split();
 
@@ -491,6 +497,7 @@ where
         // Every receive footer mirrors CONFIG0.SYNC. Losing it after bring-up means the chip
         // reset itself; flag that the host needs to re-run `configure` (spec Section 7.7).
         if self.sync_established && !footer.sync() {
+            warn!("tc6: receive footer reports SYNC=0 - MAC-PHY reset itself, re-run configure()");
             self.sync_established = false;
         }
         if footer.dv() {
@@ -521,6 +528,9 @@ where
                     frame_done = false;
                 }
             } else {
+                error!(
+                    "tc6: DV set on a fresh receive frame but SV is not - MAC-PHY framing broken"
+                );
                 panic!(
                     "we are expecting a start valid bit, as data valid is set and we are beginning a new frame (indicated by empty receive frame), but the start valid bit is not set, this should not happen"
                 );
@@ -555,6 +565,12 @@ where
         }
 
         if frame_done {
+            let len = self
+                .current_receive_buffer
+                .as_ref()
+                .map(|f| f.as_slice().len())
+                .unwrap_or(0);
+            trace!("tc6: received frame complete ({} bytes), handing to low-prio", len);
             self.rx_ready_producer
                 .enqueue(self.current_receive_buffer.take().unwrap())
                 .unwrap();
@@ -582,6 +598,9 @@ where
         if self.current_receive_buffer.is_none() {
             // TODO make sure the compiler is smart and avoids a hugely expensive copy/move of the FrameBuffer struct here, since it is a large array. It should be optimized away by the compiler, but we should check.
             self.current_receive_buffer = RxP::alloc(FrameBuffer::new()).ok();
+            if self.current_receive_buffer.is_none() {
+                warn!("tc6: rx pool exhausted - will send NORX and drop inbound data this chunk");
+            }
             if let Some(buff) = self.extra_start_buffer.as_ref() {
                 self.current_receive_buffer
                     .as_mut()
@@ -641,6 +660,13 @@ where
                 };
                 header = header.with_correct_parity();
                 let header_raw: u32 = header.raw();
+                trace!(
+                    "tc6: tx first chunk (frame len={}, ev={}, ebo={}, norx={})",
+                    len,
+                    ev,
+                    ebo,
+                    self.current_receive_buffer.is_none()
+                );
                 self.interface.begin_send_block(header_raw, data, result)?;
                 self.driver_state = TC6DriverState::WaitingForTransmitComplete;
             } else {
@@ -670,11 +696,13 @@ where
                 } else {
                     DMAPtr::from_slice(&mut self.scratch_buffer)
                 };
+                trace!("tc6: tx continuation chunk at cursor {} (ev={})", cursor, ev);
                 self.interface.begin_send_joined_block(data, result)?;
                 self.driver_state = TC6DriverState::WaitingForTransmitComplete;
             }
         } else if let Some(f) = self.current_receive_buffer.as_mut() {
             // irq fired, we have data to be read
+            trace!("tc6: rx-only chunk (nothing queued to transmit)");
             let mut header = tc6_header::TransmitHeader::new();
             // still a data chunk (DNC = 1), we just have nothing to send, so dv = 0
             header = header.with_dnc(true);
@@ -689,6 +717,7 @@ where
             self.driver_state = TC6DriverState::WaitingForTransmitComplete;
         } else {
             // irq fired, but we have no data to send nor space to receive data
+            error!("tc6: handle_idle with nothing to send and no rx buffer - unhandled state");
             todo!("what should we do here?")
         }
         Ok(())
@@ -753,11 +782,20 @@ where
 
     fn queue_control(&mut self, req: PendingControl) -> Result<(), ControlError<T::Error>> {
         if self.control_busy() {
+            trace!("tc6: register request rejected - control path busy");
             return Err(ControlError::Busy);
         }
         if req.count == 0 || req.count as usize > CONTROL_MAX_REGS {
+            warn!("tc6: register request with unsupported count {}", req.count);
             return Err(ControlError::UnsupportedCount);
         }
+        debug!(
+            "tc6: queued register {} mms={} addr={:#06x} count={}",
+            if req.write { "write" } else { "read" },
+            req.mms,
+            req.addr,
+            req.count
+        );
         self.pending_control = Some(req);
         // If the state machine is otherwise idle, kick it now so callers that don't wire up an
         // interrupt source (e.g. a blocking init loop) still make progress. Otherwise it is
@@ -823,6 +861,15 @@ where
         // echoed header would be (spec Section 7.5.1); it decodes to HDRB = 1, so this catches
         // both that and an ordinary bad-header echo.
         let header_bad = echoed_header.hdrb() || !echoed_header.parity_ok();
+        if header_bad {
+            warn!("tc6: control transaction completed with a bad command header (HDRB/parity)");
+        } else {
+            debug!(
+                "tc6: control transaction complete ({}, {} reg(s))",
+                if in_flight.write { "write" } else { "read" },
+                n
+            );
+        }
 
         let mut values = [0u32; CONTROL_MAX_REGS];
         if !header_bad {
@@ -873,7 +920,10 @@ where
     pub fn configure(&mut self, cfg: &Config) -> Result<(), ConfigError<T::Error>> {
         use registers::{addr, mms, Config0, IdVer, Status0, StdCap};
 
+        info!("tc6: configure() starting bring-up");
+
         if self.control_busy() {
+            warn!("tc6: configure() called while a control transaction is busy");
             return Err(ConfigError::Busy);
         }
 
@@ -890,9 +940,14 @@ where
             }
             tries += 1;
             if tries >= cfg.reset_poll_limit {
+                warn!(
+                    "tc6: configure() gave up waiting for STATUS0.RESETC after {} reads",
+                    tries
+                );
                 return Err(ConfigError::ResetNotComplete);
             }
         }
+        debug!("tc6: reset complete after {} STATUS0 read(s)", tries + 1);
 
         // 2. is anyone home?
         let id = IdVer::from_raw(self.read_reg_blocking(
@@ -901,11 +956,17 @@ where
             cfg.transfer_poll_limit,
         )?);
         if id.majver() == 0 {
+            error!(
+                "tc6: implausible IDVER (major={}, minor={}) - bus dead or not a TC6 device",
+                id.majver(),
+                id.minver()
+            );
             return Err(ConfigError::BadVersion {
                 major: id.majver(),
                 minor: id.minver(),
             });
         }
+        debug!("tc6: IDVER major={} minor={}", id.majver(), id.minver());
 
         // 3. capability gating
         let cap = StdCap::from_raw(self.read_reg_blocking(
@@ -914,9 +975,11 @@ where
             cfg.transfer_poll_limit,
         )?);
         if (cfg.cut_through_tx || cfg.cut_through_rx) && !cap.ctc() {
+            warn!("tc6: cut-through requested but STDCAP.CTC is not set");
             return Err(ConfigError::Unsupported("cut-through"));
         }
         if cfg.timestamp.is_some() && !cap.ftsc() {
+            warn!("tc6: frame timestamps requested but STDCAP.FTSC is not set");
             return Err(ConfigError::Unsupported("frame timestamp"));
         }
 
@@ -946,6 +1009,11 @@ where
             cfg.transfer_poll_limit,
         )?);
         if !readback.sync() || readback.cps() != 6 {
+            error!(
+                "tc6: CONFIG0 read-back bad (sync={}, cps={}) - SYNC did not stick",
+                readback.sync(),
+                readback.cps()
+            );
             return Err(ConfigError::SyncFailed);
         }
 
@@ -967,6 +1035,11 @@ where
 
         // 8. optional PLCA node setup (PHY MMS 4): write ID + node count, then enable
         if let Some(p) = cfg.plca {
+            debug!(
+                "tc6: enabling PLCA (node_id={}, node_count={})",
+                p.node_id,
+                p.node_count
+            );
             use registers::{plca, PlcaCtrl0, PlcaCtrl1};
             self.write_reg_blocking(
                 mms::PHY_VS_PLCA,
@@ -986,6 +1059,7 @@ where
         }
 
         self.sync_established = true;
+        info!("tc6: configure() complete - CONFIG0.SYNC established, data path live");
         Ok(())
     }
 
@@ -1006,6 +1080,11 @@ where
             poll_limit,
         )?;
         if res.header_bad {
+            warn!(
+                "tc6: MAC-PHY rejected control header for read mms={} addr={:#06x}",
+                mms,
+                addr
+            );
             return Err(ConfigError::HeaderRejected);
         }
         Ok(res.values()[0])
@@ -1031,6 +1110,11 @@ where
             poll_limit,
         )?;
         if res.header_bad {
+            warn!(
+                "tc6: MAC-PHY rejected control header for write mms={} addr={:#06x}",
+                mms,
+                addr
+            );
             return Err(ConfigError::HeaderRejected);
         }
         Ok(())
@@ -1064,6 +1148,10 @@ where
             }
             spins += 1;
             if spins >= poll_limit {
+                warn!(
+                    "tc6: control transfer never completed within {} polls - giving up",
+                    poll_limit
+                );
                 // don't leave the state machine wedged in WaitingForControlComplete
                 self.control_in_flight = None;
                 self.driver_state = TC6DriverState::Idle;
@@ -1121,6 +1209,7 @@ where
             f(frame.as_mut_slice())
         };
 
+        trace!("tc6: low-prio queued a {}-byte frame for transmit", len);
         queue.enqueue(frame).unwrap();
         // frame is queued: wake the high-prio side to service it
         signal.signal();
@@ -1184,6 +1273,7 @@ where
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         if !self.tx_ready_producer.ready() {
+            trace!("tc6: transmit() returning None - tx-ready queue is full");
             return None;
         }
         let tx_frame = TxP::alloc(FrameBuffer::new()).unwrap();
@@ -1467,22 +1557,25 @@ mod driver_tests {
     /// That is what lets `on_interrupt`'s loop take its `transfer_complete() == false` exit
     /// (the plain blocking `EmbeddedHalImplementation` never would). A real DMA interface
     /// behaves like this for real reasons.
+    #[cfg(feature = "embedded-hal")]
     struct PollingFake {
-        inner: crate::embeded_io_implementation::EmbeddedHalImplementation<
+        inner: crate::embedded_io_implementation::EmbeddedHalImplementation<
             fake_tc6::fake_tc6_device::FakeTc6SpiDevice,
         >,
         polls_until_done: u32,
     }
+    #[cfg(feature = "embedded-hal")]
     impl PollingFake {
         fn new(spi: fake_tc6::fake_tc6_device::FakeTc6SpiDevice) -> Self {
             Self {
-                inner: crate::embeded_io_implementation::EmbeddedHalImplementation::new(spi),
+                inner: crate::embedded_io_implementation::EmbeddedHalImplementation::new(spi),
                 polls_until_done: 0,
             }
         }
     }
+    #[cfg(feature = "embedded-hal")]
     impl Tc6Interface for PollingFake {
-        type Error = crate::embeded_io_implementation::EmbeddedHalImplementationError<
+        type Error = crate::embedded_io_implementation::EmbeddedHalImplementationError<
             fake_tc6::fake_tc6_device::FakeTc6SpiDeviceError,
         >;
 
@@ -1971,8 +2064,9 @@ mod driver_tests {
     // --------------------------------------------------------------------------------------
 
     #[test]
+    #[cfg(feature = "embedded-hal")]
     fn round_trip_transmit_through_fake_tc6() {
-        use crate::embeded_io_implementation::EmbeddedHalImplementation;
+        use crate::embedded_io_implementation::EmbeddedHalImplementation;
         use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
 
         let iface = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
@@ -2220,8 +2314,9 @@ mod driver_tests {
     }
 
     #[test]
+    #[cfg(feature = "embedded-hal")]
     fn round_trip_multi_block_transmit_through_fake_tc6() {
-        use crate::embeded_io_implementation::EmbeddedHalImplementation;
+        use crate::embedded_io_implementation::EmbeddedHalImplementation;
         use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
 
         let iface = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
@@ -2260,6 +2355,7 @@ mod driver_tests {
     /// through `on_interrupt` (the outgoing side isn't asserted here - that would need a peek
     /// at the interface).
     #[test]
+    #[cfg(feature = "embedded-hal")]
     fn black_box_round_trip_via_on_interrupt_and_device_receive() {
         use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
 
@@ -2652,8 +2748,9 @@ mod driver_tests {
     /// End to end through the real wire-format code and `fake_tc6`'s control-register model:
     /// `configure` drives actual control transactions and the chip's registers end up set.
     #[test]
+    #[cfg(feature = "embedded-hal")]
     fn configure_through_fake_tc6() {
-        use crate::embeded_io_implementation::EmbeddedHalImplementation;
+        use crate::embedded_io_implementation::EmbeddedHalImplementation;
         use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
 
         let iface = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
@@ -2677,8 +2774,9 @@ mod driver_tests {
 
     /// End to end: PLCA node setup reaches the PHY's MMS 4 registers through the real wire path.
     #[test]
+    #[cfg(feature = "embedded-hal")]
     fn configure_with_plca_through_fake_tc6() {
-        use crate::embeded_io_implementation::EmbeddedHalImplementation;
+        use crate::embedded_io_implementation::EmbeddedHalImplementation;
         use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
 
         let iface = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
@@ -2701,8 +2799,9 @@ mod driver_tests {
     /// End to end: when `fake_tc6` streams the `0xC0000001` header-error code (spec 7.5.1),
     /// the driver surfaces `header_bad` with no register values.
     #[test]
+    #[cfg(feature = "embedded-hal")]
     fn control_header_parity_error_surfaced_through_fake_tc6() {
-        use crate::embeded_io_implementation::EmbeddedHalImplementation;
+        use crate::embedded_io_implementation::EmbeddedHalImplementation;
         use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
 
         let mut spi = FakeTc6SpiDevice::new();

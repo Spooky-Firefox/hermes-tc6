@@ -3,14 +3,37 @@ name = "hermes-tc6"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["embedded-hal"]
+# `EmbeddedHalImplementation` - the ready-made `Tc6Interface` built on a blocking
+# `embedded-hal` `SpiDevice`. On by default; turn it off (`default-features = false`)
+# if you only ever use your own `Tc6Interface` impl (e.g. a DMA transport) and would
+# rather not pull in `embedded-hal`.
+embedded-hal = ["dep:embedded-hal"]
+# Route this crate's internal logging to `defmt` or to the `log` facade. Enable at
+# most one; turning on both is a compile error (see `src/fmt.rs`). With neither, the
+# log macros expand to nothing and the crate stays dependency-free here.
+#
+# These only wire up *this* crate. smoltcp has its own mutually-exclusive
+# `log` / `defmt` features (and `log` is on by its defaults) - configure that in
+# the application crate if you want smoltcp's own tracing on the same backend.
+#
+# Note: `cargo test --features defmt` will not link (no defmt global logger in a
+# host binary); the host test suite runs with no logging, or with `--features log`.
+defmt = ["dep:defmt"]
+log = ["dep:log"]
+
 [dev-dependencies]
 fake_tc6 = { path = "fake_tc6" }
 
 [dependencies]
 embedded-dma = "0.2.0"
-embedded-hal = "1.0.0"
+embedded-hal = { version = "1.0.0", optional = true }
 # "pool" (used by tc6_driver) needs portable-atomic on targets without native wide-CAS/arm_llsc;
 # swap for "portable-atomic-unsafe-assume-single-core" if you'd rather not depend on a
 # critical-section impl being registered, but only on genuinely single-core MCUs.
 heapless = { version = "0.9.3", features = ["portable-atomic-critical-section"] }
 smoltcp = "0.13.1"
+
+defmt = { version = "1", optional = true }
+log = { version = "0.4", optional = true }
