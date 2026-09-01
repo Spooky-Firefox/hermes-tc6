@@ -467,6 +467,54 @@ impl MdioAcc {
     pub const RESET_VALUE: Self = Self(0x8C00_0000);
 }
 
+/// PLCA (Physical Layer Collision Avoidance) register addresses, MMS 4 / MMD 31 (spec Table 29).
+///
+/// These are 16-bit registers, right-aligned in the 32-bit control word. Access them with
+/// [`mms::PHY_VS_PLCA`]. Bit layout follows the OPEN Alliance PLCA register mapping (the IEEE
+/// 802.3cg Clause 148 management variables) - confirm against the specific PHY datasheet.
+pub mod plca {
+    /// PLCA ID/version register (0xCA00), read-only map identifier.
+    pub const IDVER: u16 = 0xCA00;
+    /// PLCA control 0 register (0xCA01), [`super::PlcaCtrl0`].
+    pub const CTRL0: u16 = 0xCA01;
+    /// PLCA control 1 register (0xCA02), [`super::PlcaCtrl1`].
+    pub const CTRL1: u16 = 0xCA02;
+    /// PLCA status register (0xCA03), [`super::PlcaStatus`].
+    pub const STATUS: u16 = 0xCA03;
+    /// PLCA transmit-opportunity timer register (0xCA04); low 8 bits, reset `0x20` (32 bit times).
+    pub const TOTMR: u16 = 0xCA04;
+    /// PLCA burst-control register (0xCA05): `MAXBC` in bits 15..8, burst timer in bits 7..0.
+    pub const BURST: u16 = 0xCA05;
+}
+
+define_register! {
+    /// `PLCA CTRL0` (MMS 4, `0xCA01`) — PLCA enable / reset.
+    PlcaCtrl0 {
+        /// `RST` (bit 8) — reset the PLCA reconciliation sublayer.
+        reset, with_reset: bool @ 8;
+        /// `EN` (bit 15) — enable PLCA; clear to fall back to plain CSMA/CD.
+        enable, with_enable: bool @ 15;
+    }
+}
+
+define_register! {
+    /// `PLCA CTRL1` (MMS 4, `0xCA02`) — this node's PLCA identity.
+    PlcaCtrl1 {
+        /// `ID` (bits 7..0) — local node ID. `0` is the coordinator, which sends the BEACON.
+        id, with_id: u8 @ 0, 0xFF;
+        /// `NCNT` (bits 15..8) — total node count. Only meaningful on the coordinator (`ID` = 0).
+        node_count, with_node_count: u8 @ 8, 0xFF;
+    }
+}
+
+define_register! {
+    /// `PLCA STATUS` (MMS 4, `0xCA03`) — PLCA operating status (read-only).
+    PlcaStatus {
+        /// `PST` (bit 15) — `1` while PLCA is actively controlling media access.
+        pst, with_pst: bool @ 15;
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -580,5 +628,20 @@ mod test {
     fn roundtrip_bytes() {
         let cfg = Config0::RESET_VALUE.with_sync(true).with_txcte(true);
         assert_eq!(Config0::from_bytes(cfg.to_bytes()), cfg);
+    }
+
+    #[test]
+    fn plca_ctrl1_packs_id_and_node_count() {
+        let c1 = PlcaCtrl1::from_raw(0).with_id(0x07).with_node_count(0x10);
+        assert_eq!(c1.id(), 0x07);
+        assert_eq!(c1.node_count(), 0x10);
+        assert_eq!(c1.raw(), 0x0000_1007);
+
+        let c0 = PlcaCtrl0::from_raw(0).with_enable(true);
+        assert_eq!(c0.raw(), 0x0000_8000);
+        assert!(c0.enable() && !c0.reset());
+
+        assert!(PlcaStatus::from_raw(0x0000_8000).pst());
+        assert!(!PlcaStatus::from_raw(0).pst());
     }
 }

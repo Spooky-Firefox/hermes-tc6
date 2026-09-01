@@ -150,11 +150,42 @@ pub enum TimestampSize {
     Bits64,
 }
 
+/// PLCA (Physical Layer Collision Avoidance) node setup, written to the PHY's MMS 4 registers
+/// during [`TC6HighPrio::configure`].
+///
+/// The MAC-PHY runs the PLCA state machine, but every node must be told its own ID - there is no
+/// auto-assignment. Build one with [`PlcaConfig::follower`] or [`PlcaConfig::coordinator`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlcaConfig {
+    /// This node's PLCA ID (`0..=254`). Node `0` is the coordinator and sends the BEACON.
+    pub node_id: u8,
+    /// Total node count. Only used by the coordinator (`node_id == 0`); ignored otherwise.
+    pub node_count: u8,
+}
+
+impl PlcaConfig {
+    /// A follower node with the given ID. Node count is only needed on the coordinator.
+    pub const fn follower(node_id: u8) -> Self {
+        Self {
+            node_id,
+            node_count: 0,
+        }
+    }
+
+    /// The coordinator (node 0), which sends the BEACON, for a network of `node_count` nodes.
+    pub const fn coordinator(node_count: u8) -> Self {
+        Self {
+            node_id: 0,
+            node_count,
+        }
+    }
+}
+
 /// Bring-up configuration applied by [`TC6HighPrio::configure`] / [`split_configured`].
 ///
 /// [`Config::default`] is the minimal safe setup: unprotected control, >= 1 transmit credit
-/// before IRQn, no cut-through, no timestamps, every maskable interrupt masked. The chunk
-/// payload size is always forced to 64 bytes - the data path assumes it.
+/// before IRQn, no cut-through, no timestamps, PLCA left untouched, every maskable interrupt
+/// masked. The chunk payload size is always forced to 64 bytes - the data path assumes it.
 //
 // TODO: `CONFIG0.PROTE` (protected control transfers - each 32-bit word sent with its ones'
 // complement, spec 7.4.4) is not offered here yet: the control path in `start_control_transaction`
@@ -169,6 +200,9 @@ pub struct Config {
     pub cut_through_rx: bool,
     /// `Some` enables `CONFIG0.FTSE` and picks the width via `FTSS`. Requires `STDCAP.FTSC`.
     pub timestamp: Option<TimestampSize>,
+    /// `Some` sets this node's PLCA ID / node count and enables PLCA; `None` leaves the PHY's
+    /// PLCA registers untouched (strap defaults / plain CSMA/CD).
+    pub plca: Option<PlcaConfig>,
     /// Value written to `IMASK0`. Defaults to [`registers::IMask0::RESET_VALUE`].
     pub interrupt_mask: registers::IMask0,
     /// Max busy-wait iterations for a single control transfer to report complete before
@@ -185,6 +219,7 @@ impl Default for Config {
             cut_through_tx: false,
             cut_through_rx: false,
             timestamp: None,
+            plca: None,
             interrupt_mask: registers::IMask0::RESET_VALUE,
             transfer_poll_limit: 100_000,
             reset_poll_limit: 64,
@@ -807,7 +842,8 @@ where
     /// 4. write `CONFIG0` with a 64-byte chunk payload and `SYNC = 1`,
     /// 5. read `CONFIG0` back and confirm `SYNC` stuck,
     /// 6. program `IMASK0`,
-    /// 7. clear latched `STATUS0` bits (including `RESETC`).
+    /// 7. clear latched `STATUS0` bits (including `RESETC`),
+    /// 8. if `cfg.plca` is set, write this node's PLCA ID / node count and enable PLCA.
     ///
     /// Call this from init (or after a footer reports `SYNC = 0`) *before* servicing data
     /// traffic. It only touches control registers - the frame queues are untouched - and it
@@ -908,6 +944,26 @@ where
             Status0::clear_all().raw(),
             cfg.transfer_poll_limit,
         )?;
+
+        // 8. optional PLCA node setup (PHY MMS 4): write ID + node count, then enable
+        if let Some(p) = cfg.plca {
+            use registers::{plca, PlcaCtrl0, PlcaCtrl1};
+            self.write_reg_blocking(
+                mms::PHY_VS_PLCA,
+                plca::CTRL1,
+                PlcaCtrl1::from_raw(0)
+                    .with_id(p.node_id)
+                    .with_node_count(p.node_count)
+                    .raw(),
+                cfg.transfer_poll_limit,
+            )?;
+            self.write_reg_blocking(
+                mms::PHY_VS_PLCA,
+                plca::CTRL0,
+                PlcaCtrl0::from_raw(0).with_enable(true).raw(),
+                cfg.transfer_poll_limit,
+            )?;
+        }
 
         self.sync_established = true;
         Ok(())
@@ -2516,6 +2572,31 @@ mod driver_tests {
         assert!(registers::Config0::from_raw(hi.interface.reg(0, 0x0004)).sync());
     }
 
+    #[test]
+    fn configure_sets_up_plca_when_requested() {
+        setup!(hi, _lo, RegDouble::new(), NoopSignal);
+        let cfg = Config {
+            plca: Some(PlcaConfig::coordinator(8)),
+            ..Config::default()
+        };
+        hi.configure(&cfg).expect("bring-up ok");
+
+        let c1 = registers::PlcaCtrl1::from_raw(hi.interface.reg(4, 0xCA02));
+        assert_eq!(c1.id(), 0, "coordinator is node 0");
+        assert_eq!(c1.node_count(), 8);
+        assert!(registers::PlcaCtrl0::from_raw(hi.interface.reg(4, 0xCA01)).enable());
+    }
+
+    #[test]
+    fn configure_without_plca_touches_no_mms4_registers() {
+        setup!(hi, _lo, RegDouble::new(), NoopSignal);
+        hi.configure(&Config::default()).expect("bring-up ok");
+        assert!(
+            !hi.interface.writes.iter().any(|&(mms, _, _)| mms == 4),
+            "PLCA registers left untouched when cfg.plca is None"
+        );
+    }
+
     /// End to end through the real wire-format code and `fake_tc6`'s control-register model:
     /// `configure` drives actual control transactions and the chip's registers end up set.
     #[test]
@@ -2540,6 +2621,29 @@ mod driver_tests {
             registers::IMask0::RESET_VALUE.raw(),
             "IMASK0 programmed"
         );
+    }
+
+    /// End to end: PLCA node setup reaches the PHY's MMS 4 registers through the real wire path.
+    #[test]
+    fn configure_with_plca_through_fake_tc6() {
+        use crate::embeded_io_implementation::EmbeddedHalImplementation;
+        use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
+
+        let iface = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
+        setup!(hi, _lo, iface, NoopSignal);
+
+        let cfg = Config {
+            plca: Some(PlcaConfig::follower(3)),
+            ..Config::default()
+        };
+        hi.configure(&cfg).expect("bring-up with PLCA");
+
+        let dev = &hi.interface.inner_mut().device;
+        assert_eq!(
+            registers::PlcaCtrl1::from_raw(dev.read_reg(4, 0xCA02)).id(),
+            3
+        );
+        assert!(registers::PlcaCtrl0::from_raw(dev.read_reg(4, 0xCA01)).enable());
     }
 
     /// End to end: when `fake_tc6` streams the `0xC0000001` header-error code (spec 7.5.1),

@@ -92,6 +92,8 @@ pub struct FakeTc6Device {
     // --- command mode (control register read/write, spec Section 7.4) ---
     // MMS 0 standard control/status register file (all 32-bit).
     regs_mms0: [u32; MMS0_REGS],
+    // MMS 4 (PHY vendor specific / PLCA, MMD 31) - only the 0xCA00..=0xCA07 PLCA block.
+    regs_mms4: [u32; 8],
     // MOSI bytes seen so far in the current Command-mode transaction, so write data can be
     // echoed back (spec Section 7.4.4) and applied once each 32-bit word is complete.
     command_mosi: vec::Vec<u8>,
@@ -113,6 +115,7 @@ impl FakeTc6Device {
             receive_buff: Vec::new(),
             receive_footer: ReceiveFooter::new(),
             regs_mms0: [0; MMS0_REGS],
+            regs_mms4: [0; 8],
             command_mosi: Vec::new(),
             force_bad_control_header: false,
         };
@@ -131,43 +134,61 @@ impl FakeTc6Device {
         self.regs_mms0[0x04] = 0x0000_0006; // CONFIG0: CPS=6
         self.regs_mms0[0x08] = 0x0000_0040; // STATUS0: RESETC
         self.regs_mms0[0x0C] = 0x0000_1FBF; // IMASK0 : reset value
+
+        self.regs_mms4 = [0; 8];
+        self.regs_mms4[0] = 0x0000_0A01; // PLCA IDVER: map id 0x0A, version 1
     }
 
-    /// Read a standard (MMS 0) register. Other memory maps and undefined addresses read as 0
-    /// (spec Section 7.4.3).
+    /// Read a control register. Standard (MMS 0) and the PLCA block (MMS 4, 0xCA00..) are
+    /// modelled; other memory maps and undefined addresses read as 0 (spec Section 7.4.3).
     pub fn read_reg(&self, mms: u8, addr: u16) -> u32 {
-        if mms != 0 {
-            return 0;
-        }
-        match addr {
-            // BUFSTS: TXC (bits 15..8) plenty of credit, RCA (bits 7..0) = queued rx frames
-            0x000B => (0x10 << 8) | (self.receive_buff.len().min(0xFF) as u32),
-            a if (a as usize) < MMS0_REGS => self.regs_mms0[a as usize],
+        match mms {
+            0 => match addr {
+                // BUFSTS: TXC (bits 15..8) plenty of credit, RCA (bits 7..0) = queued rx frames
+                0x000B => (0x10 << 8) | (self.receive_buff.len().min(0xFF) as u32),
+                a if (a as usize) < MMS0_REGS => self.regs_mms0[a as usize],
+                _ => 0,
+            },
+            4 => self
+                .regs_mms4
+                .get(addr.wrapping_sub(0xCA00) as usize)
+                .copied()
+                .unwrap_or(0),
             _ => 0,
         }
     }
 
-    /// Write a standard (MMS 0) register, honouring read-only / write-1-to-clear / sticky
-    /// semantics. Writes elsewhere are ignored (spec Section 7.4.2/7.4.3).
+    /// Write a control register, honouring read-only / write-1-to-clear / sticky semantics.
+    /// Writes to unmodelled maps/addresses are ignored (spec Section 7.4.2/7.4.3).
     fn write_reg(&mut self, mms: u8, addr: u16, val: u32) {
-        if mms != 0 {
-            return;
-        }
-        match addr {
-            0x0000 | 0x0001 | 0x0002 | 0x000B => {} // read-only
-            0x0003 => {
-                // RESET.SWRESET: self-clearing, triggers a full reset
-                if val & 1 != 0 {
-                    self.reset_registers();
+        match mms {
+            0 => match addr {
+                0x0000 | 0x0001 | 0x0002 | 0x000B => {} // read-only
+                0x0003 => {
+                    // RESET.SWRESET: self-clearing, triggers a full reset
+                    if val & 1 != 0 {
+                        self.reset_registers();
+                    }
+                }
+                0x0004 => {
+                    // CONFIG0: SYNC (bit 15) cannot be cleared once set (spec 7.6)
+                    let sticky_sync = self.regs_mms0[0x04] & (1 << 15);
+                    self.regs_mms0[0x04] = val | sticky_sync;
+                }
+                0x0008 => self.regs_mms0[0x08] &= !val, // STATUS0: write 1 to clear
+                a if (a as usize) < MMS0_REGS => self.regs_mms0[a as usize] = val,
+                _ => {}
+            },
+            4 => {
+                // PLCA IDVER (0xCA00) and STATUS (0xCA03) are read-only
+                if addr != 0xCA00
+                    && addr != 0xCA03
+                    && let Some(slot) =
+                        self.regs_mms4.get_mut(addr.wrapping_sub(0xCA00) as usize)
+                {
+                    *slot = val;
                 }
             }
-            0x0004 => {
-                // CONFIG0: SYNC (bit 15) cannot be cleared once set (spec 7.6)
-                let sticky_sync = self.regs_mms0[0x04] & (1 << 15);
-                self.regs_mms0[0x04] = val | sticky_sync;
-            }
-            0x0008 => self.regs_mms0[0x08] &= !val, // STATUS0: write 1 to clear
-            a if (a as usize) < MMS0_REGS => self.regs_mms0[a as usize] = val,
             _ => {}
         }
     }
