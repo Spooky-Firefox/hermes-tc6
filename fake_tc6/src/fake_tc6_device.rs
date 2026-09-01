@@ -1,8 +1,12 @@
 use crate::{
+    control_header::ControlHeader,
     fake_tc6_device::Mode::{Command, ReadingCommandHeader, ReadingHeader, ReadingWritingBlock},
     receive_footer::{self, ReceiveFooter},
     transmit_header::TransmitHeader,
 };
+
+/// Number of MMS 0 (standard control/status) register slots this fake models.
+const MMS0_REGS: usize = 0x40;
 use embedded_hal::spi::{self, Operation, SpiDevice};
 use log::{info, trace, warn};
 use std::vec;
@@ -84,11 +88,18 @@ pub struct FakeTc6Device {
     transmit_buff: vec::Vec<vec::Vec<u8>>,
     // buffer of received eth frames from wire
     receive_buff: vec::Vec<vec::Vec<u8>>,
+
+    // --- command mode (control register read/write, spec Section 7.4) ---
+    // MMS 0 standard control/status register file (all 32-bit).
+    regs_mms0: [u32; MMS0_REGS],
+    // MOSI bytes seen so far in the current Command-mode transaction, so write data can be
+    // echoed back (spec Section 7.4.4) and applied once each 32-bit word is complete.
+    command_mosi: vec::Vec<u8>,
 }
 
 impl FakeTc6Device {
     fn new() -> FakeTc6Device {
-        FakeTc6Device {
+        let mut dev = FakeTc6Device {
             mode: ReadingHeader(0),
             block_size: DEFAULT_BLOCK_SIZE,
             mosi_header_raw: [0; 4],
@@ -98,6 +109,62 @@ impl FakeTc6Device {
             transmit_buff: Vec::new(),
             receive_buff: Vec::new(),
             receive_footer: ReceiveFooter::new(),
+            regs_mms0: [0; MMS0_REGS],
+            command_mosi: Vec::new(),
+        };
+        dev.reset_registers();
+        dev
+    }
+
+    /// Restore the MMS 0 register file to power-on defaults: v1.1 IDVER, a STDCAP advertising
+    /// cut-through / frame-timestamp / address-increment-disable and a 64-byte minimum chunk
+    /// payload, CONFIG0 with CPS = 6 and SYNC = 0, STATUS0 with RESETC set, IMASK0 masking
+    /// every maskable interrupt.
+    fn reset_registers(&mut self) {
+        self.regs_mms0 = [0; MMS0_REGS];
+        self.regs_mms0[0x00] = 0x0000_0011; // IDVER  : MAJVER=1, MINVER=1
+        self.regs_mms0[0x02] = 0x0000_00E6; // STDCAP : CTC | FTSC | AIDC | MINCPS=6
+        self.regs_mms0[0x04] = 0x0000_0006; // CONFIG0: CPS=6
+        self.regs_mms0[0x08] = 0x0000_0040; // STATUS0: RESETC
+        self.regs_mms0[0x0C] = 0x0000_1FBF; // IMASK0 : reset value
+    }
+
+    /// Read a standard (MMS 0) register. Other memory maps and undefined addresses read as 0
+    /// (spec Section 7.4.3).
+    pub fn read_reg(&self, mms: u8, addr: u16) -> u32 {
+        if mms != 0 {
+            return 0;
+        }
+        match addr {
+            // BUFSTS: TXC (bits 15..8) plenty of credit, RCA (bits 7..0) = queued rx frames
+            0x000B => (0x10 << 8) | (self.receive_buff.len().min(0xFF) as u32),
+            a if (a as usize) < MMS0_REGS => self.regs_mms0[a as usize],
+            _ => 0,
+        }
+    }
+
+    /// Write a standard (MMS 0) register, honouring read-only / write-1-to-clear / sticky
+    /// semantics. Writes elsewhere are ignored (spec Section 7.4.2/7.4.3).
+    fn write_reg(&mut self, mms: u8, addr: u16, val: u32) {
+        if mms != 0 {
+            return;
+        }
+        match addr {
+            0x0000 | 0x0001 | 0x0002 | 0x000B => {} // read-only
+            0x0003 => {
+                // RESET.SWRESET: self-clearing, triggers a full reset
+                if val & 1 != 0 {
+                    self.reset_registers();
+                }
+            }
+            0x0004 => {
+                // CONFIG0: SYNC (bit 15) cannot be cleared once set (spec 7.6)
+                let sticky_sync = self.regs_mms0[0x04] & (1 << 15);
+                self.regs_mms0[0x04] = val | sticky_sync;
+            }
+            0x0008 => self.regs_mms0[0x08] &= !val, // STATUS0: write 1 to clear
+            a if (a as usize) < MMS0_REGS => self.regs_mms0[a as usize] = val,
+            _ => {}
         }
     }
 
@@ -262,16 +329,67 @@ impl FakeTc6Device {
         Ok(out)
     }
 
+    /// Command mode: everything after the 4-byte control command header. `i` counts bytes from
+    /// the first post-header byte. MISO layout (spec Figures 13/14): 4 bytes echoed control
+    /// header, then `LEN+1` 32-bit words of echoed write data (reads emit the register value).
+    /// The 4 "RX chunk data (discard)" bytes are emitted earlier, during the header phase.
     fn handle_command(&mut self, byte: u8, i: usize) -> Result<u8, FakeTc6DeviceError> {
-        todo!()
+        let hdr = ControlHeader::from_slice(&self.mosi_header_raw).expect("4-byte header");
+        let n_words = hdr.len as usize + 1;
+        // full transaction is 4*(LEN+3) bytes; command mode is that minus the 4 header bytes
+        let cmd_len = 4 * (n_words + 2) - 4;
+
+        self.command_mosi.push(byte);
+
+        let out = if i < 4 {
+            // echoed control command header
+            self.mosi_header_raw[i]
+        } else {
+            let data_i = i - 4;
+            let word = data_i / 4;
+            let byte_in_word = data_i % 4;
+            let reg_addr = if hdr.aid {
+                hdr.addr
+            } else {
+                hdr.addr.wrapping_add(word as u16)
+            };
+            if hdr.wnr {
+                // echo the write-data byte that arrived one 32-bit word earlier, and apply the
+                // write once the whole word has been received
+                let echoed = self.command_mosi[data_i];
+                if byte_in_word == 3 {
+                    let ws = data_i - 3;
+                    let value = u32::from_be_bytes([
+                        self.command_mosi[ws],
+                        self.command_mosi[ws + 1],
+                        self.command_mosi[ws + 2],
+                        self.command_mosi[ws + 3],
+                    ]);
+                    self.write_reg(hdr.mms, reg_addr, value);
+                }
+                echoed
+            } else {
+                self.read_reg(hdr.mms, reg_addr).to_be_bytes()[byte_in_word]
+            }
+        };
+
+        if i + 1 >= cmd_len {
+            self.command_mosi.clear();
+            self.mode = ReadingHeader(0);
+        } else {
+            self.mode = Command(i + 1);
+        }
+        Ok(out)
     }
 
     fn handle_reading_command_header(
         &mut self,
-        byte: u8,
-        i: usize,
+        _byte: u8,
+        _i: usize,
     ) -> Result<u8, FakeTc6DeviceError> {
-        todo!()
+        // Control headers are recognised and parsed in `handle_reading_header` (DNC = 0 ->
+        // `Command`), so this mode is never entered.
+        unreachable!("ReadingCommandHeader is unused; see handle_reading_header")
     }
 
     fn handle_byte(&mut self, byte: u8) -> Result<u8, FakeTc6DeviceError> {

@@ -2518,6 +2518,32 @@ mod driver_tests {
         assert!(registers::Config0::from_raw(hi.interface.reg(0, 0x0004)).sync());
     }
 
+    /// End to end through the real wire-format code and `fake_tc6`'s control-register model:
+    /// `configure` drives actual control transactions and the chip's registers end up set.
+    #[test]
+    fn configure_through_fake_tc6() {
+        use crate::embeded_io_implementation::EmbeddedHalImplementation;
+        use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
+
+        let iface = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
+        setup!(hi, _lo, iface, NoopSignal);
+
+        hi.configure(&Config::default())
+            .expect("bring-up through the real wire format");
+        assert!(hi.is_configured());
+
+        let dev = &hi.interface.inner_mut().device;
+        let c0 = registers::Config0::from_raw(dev.read_reg(0, 0x0004));
+        assert!(c0.sync(), "CONFIG0.SYNC set on the chip");
+        assert_eq!(c0.cps(), 6);
+        assert_eq!(dev.read_reg(0, 0x0008) & 0x40, 0, "RESETC cleared");
+        assert_eq!(
+            dev.read_reg(0, 0x000C),
+            registers::IMask0::RESET_VALUE.raw(),
+            "IMASK0 programmed"
+        );
+    }
+
     /// A receive footer with SYNC = 0 after bring-up means the chip reset itself; the driver
     /// drops its "configured" flag so the host knows to re-run `configure`.
     #[test]
