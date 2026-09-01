@@ -338,6 +338,8 @@ impl FakeTc6Device {
                 if self.transmit_header.norx {
                     self.receive_footer = ReceiveFooter::new();
                 }
+                // every data footer mirrors CONFIG0.SYNC (spec 7.3.7 / 7.6)
+                self.receive_footer.sync = self.regs_mms0[0x04] & (1 << 15) != 0;
                 self.miso_footer = self.receive_footer.to_bytes();
             }
             self.miso_footer[i - self.block_size.saturating_sub(4)]

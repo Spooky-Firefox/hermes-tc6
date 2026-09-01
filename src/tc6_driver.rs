@@ -301,6 +301,11 @@ where
 ///
 /// `rx_ready`/`tx_ready` need `'static` storage from the caller (e.g. `static_cell` or a
 /// `static mut` in `#[init]`). `RxP`/`TxP` must already have their memory blocks `manage`d.
+///
+/// The returned driver is **unconfigured**: [`TC6HighPrio::configure`] must succeed before any
+/// frame data will move (the data path is inert while `SYNC = 0`). Prefer [`split_configured`]
+/// unless you specifically need to defer bring-up (e.g. the SPI transport is not ready yet).
+#[must_use = "the driver does nothing until TC6HighPrio::configure succeeds"]
 pub fn split<T, RxP, TxP, S, const M: usize, const NQ: usize>(
     interface: T,
     rx_ready: &'static mut Queue<Box<RxP>, NQ>,
@@ -388,7 +393,14 @@ where
         // we might have a frame to receive
         loop {
             match self.driver_state {
-                TC6DriverState::Idle => self.handle_idle()?,
+                TC6DriverState::Idle => {
+                    self.handle_idle()?;
+                    if matches!(self.driver_state, TC6DriverState::Idle) {
+                        // `handle_idle` started nothing (not configured yet, or no receive
+                        // buffer / transmit frame available) - stop spinning.
+                        break;
+                    }
+                }
                 TC6DriverState::WaitingForTransmitComplete => {
                     if self.interface.transfer_complete()? {
                         self.handle_transmit_complete()?;
@@ -556,6 +568,14 @@ where
         // control transaction is pending we must not start a data transfer.
         if self.pending_control.is_some() {
             return self.start_control_transaction();
+        }
+
+        // Until `configure` has driven CONFIG0.SYNC = 1, the MAC-PHY ignores transmit data
+        // chunks and returns DV = 0, so running the data path would just churn the pool and the
+        // SPI bus for nothing. Stay idle; frames the low-prio side enqueues wait in the bounded
+        // queue (and `transmit()` starts returning None once it fills).
+        if !self.sync_established {
+            return Ok(());
         }
 
         // do we have a receive buffer ready to fill? if not allocate one from the pool and queue it up for the tc6 chip to fill
@@ -1245,11 +1265,23 @@ mod driver_tests {
         result_len: usize,
     }
 
-    #[derive(Default)]
     struct SpyInterface {
         chunks: Vec<Chunk>,
         control_txns: Vec<ControlTxn>,
         complete: bool,
+        /// footers handed back by `respond` carry SYNC = 1 (a configured chip) unless cleared
+        footer_sync: bool,
+    }
+
+    impl Default for SpyInterface {
+        fn default() -> Self {
+            Self {
+                chunks: Vec::new(),
+                control_txns: Vec::new(),
+                complete: false,
+                footer_sync: true,
+            }
+        }
     }
 
     impl SpyInterface {
@@ -1312,6 +1344,11 @@ mod driver_tests {
         /// and mark the transfer complete.
         fn respond(&mut self, payload: &[u8], footer: crate::tc6_footer::ReceiveFooter) {
             assert!(payload.len() <= 64);
+            let footer = if self.footer_sync {
+                footer.with_sync(true).with_correct_parity()
+            } else {
+                footer
+            };
             let c = self.chunks.last().expect("no chunk sent yet");
             assert_eq!(c.result_len, 68, "MISO buffer is 64B data + 4B footer");
             // SAFETY: `result_ptr` came from `WriteBuffer::write_buffer` of the buffer the
@@ -1753,6 +1790,7 @@ mod driver_tests {
     #[test]
     fn transmit_token_builds_one_full_data_chunk() {
         setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true; // data-path test: pretend configure() ran
 
         let payload = ethernet_like(64);
         {
@@ -1788,6 +1826,7 @@ mod driver_tests {
     #[test]
     fn transmit_completion_without_receive_data_returns_to_idle() {
         setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true; // data-path test: pretend configure() ran
 
         {
             let tok = lo.transmit(Instant::ZERO).unwrap();
@@ -1817,6 +1856,7 @@ mod driver_tests {
     #[test]
     fn receives_single_block_frame_and_hands_it_to_low_prio() {
         setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true; // data-path test: pretend configure() ran
 
         // no frame queued for tx -> handle_idle issues a receive-only ("joined") chunk
         hi.handle_idle().unwrap();
@@ -1854,6 +1894,7 @@ mod driver_tests {
     #[test]
     fn receive_only_chunk_targets_the_receive_buffer_tail() {
         setup!(hi, _lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true; // data-path test: pretend configure() ran
 
         hi.handle_idle().unwrap();
 
@@ -1936,6 +1977,7 @@ mod driver_tests {
 
         let iface = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
         setup!(hi, lo, iface, NoopSignal);
+        hi.sync_established = true; // data-path test: pretend configure() ran
 
         let payload = ethernet_like(64);
         {
@@ -1977,6 +2019,7 @@ mod driver_tests {
     #[test]
     fn receives_frame_spanning_two_blocks() {
         setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true; // data-path test: pretend configure() ran
 
         let head = ethernet_like(64);
         let tail: Vec<u8> = (0..20u8).map(|i| 200 + i).collect();
@@ -2027,6 +2070,7 @@ mod driver_tests {
     #[test]
     fn transmit_frame_is_sent_once_then_driver_polls_for_receive() {
         setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true; // data-path test: pretend configure() ran
 
         let payload = ethernet_like(64);
         {
@@ -2065,6 +2109,7 @@ mod driver_tests {
     #[test]
     fn transmits_frame_spanning_two_blocks_as_block_then_joined_chunk() {
         setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true; // data-path test: pretend configure() ran
 
         // 128 bytes == exactly two blocks
         let payload = ethernet_like(128);
@@ -2140,6 +2185,7 @@ mod driver_tests {
     #[test]
     fn transmits_frame_with_partial_final_block_sets_ebo() {
         setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true; // data-path test: pretend configure() ran
 
         let payload = ethernet_like(100); // 64 + 36
         {
@@ -2180,6 +2226,7 @@ mod driver_tests {
 
         let iface = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
         setup!(hi, lo, iface, NoopSignal);
+        hi.configure(&Config::default()).expect("bring-up");
 
         let payload = ethernet_like(192); // three blocks
         {
@@ -2218,11 +2265,15 @@ mod driver_tests {
 
         let rx_frame: Vec<u8> = (0..128u32).map(|i| (i as u8) ^ 0x5A).collect();
 
-        // seed the MAC-PHY *before* it becomes part of the driver - the only pre-split touch
-        let mut spi = FakeTc6SpiDevice::new();
-        spi.device.enqueue_receive_frame(rx_frame.clone());
-
-        setup!(hi, lo, PollingFake::new(spi), NoopSignal);
+        setup!(hi, lo, PollingFake::new(FakeTc6SpiDevice::new()), NoopSignal);
+        hi.configure(&Config::default()).expect("bring-up");
+        // seed the MAC-PHY with a frame to receive (after bring-up so the control traffic
+        // doesn't run over it)
+        hi.interface
+            .inner
+            .inner_mut()
+            .device
+            .enqueue_receive_frame(rx_frame.clone());
 
         // queue a frame to go out as well
         {
@@ -2424,6 +2475,7 @@ mod driver_tests {
     #[test]
     fn pending_control_is_serviced_before_data() {
         setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true; // data-path test: pretend configure() ran
 
         // a frame is waiting to go out...
         {
@@ -2690,6 +2742,7 @@ mod driver_tests {
         assert!(hi.is_configured());
 
         // ...then one that reports SYNC = 0 -> flag cleared
+        hi.interface.footer_sync = false;
         hi.handle_idle().unwrap();
         hi.interface.respond(
             &[],
