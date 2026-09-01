@@ -57,4 +57,21 @@ impl<T: SpiDevice> crate::tc6_interface::Tc6Interface for EmbeddedHalImplementat
     fn transfer_complete(&mut self) -> Result<bool, Self::Error> {
         Ok(true)
     }
+
+    fn begin_control_transaction(
+        &mut self,
+        tx: impl embedded_dma::ReadBuffer<Word = u8>,
+        mut rx: impl embedded_dma::WriteBuffer<Word = u8>,
+    ) -> Result<(), Self::Error> {
+        let tx = unsafe { slice::from_raw_parts(tx.read_buffer().0, tx.read_buffer().1) };
+        let rx =
+            unsafe { slice::from_raw_parts_mut(rx.write_buffer().0, rx.write_buffer().1) };
+        if rx.len() != tx.len() {
+            return Err(EmbeddedHalImplementationError::BufferSizeMismatch);
+        }
+        use embedded_hal::spi::Operation;
+        self.inner
+            .transaction(&mut [Operation::Transfer(rx, tx)])
+            .map_err(EmbeddedHalImplementationError::SpiError)
+    }
 }

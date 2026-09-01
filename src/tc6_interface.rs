@@ -15,6 +15,22 @@ pub trait Tc6Interface {
     // this function is called by the driver to check if the transfer is complete, it should return true if the transfer is complete and false if it is still in progress
     fn transfer_complete(&mut self) -> Result<bool, Self::Error>;
 
+    /// Runs one control-mode SPI transaction (a register read or write), see TC6 spec Section 7.4.
+    ///
+    /// Unlike the data-chunk methods this is a plain full-duplex transfer: `tx` and `rx` must be
+    /// the same length and the driver has already laid `tx` out as
+    /// `[4-byte control command header][register data / don't-care ...][4-byte don't-care]`.
+    /// `rx` receives the MISO stream, which is `tx` delayed by one 32-bit word:
+    /// `[4 don't-care bytes][echoed control header][echoed write data / read data ...]`.
+    ///
+    /// Completion is reported the same way as data chunks, through
+    /// [`transfer_complete`](Self::transfer_complete).
+    fn begin_control_transaction(
+        &mut self,
+        tx: impl ReadBuffer<Word = u8>,
+        rx: impl WriteBuffer<Word = u8>,
+    ) -> Result<(), Self::Error>;
+
     /// This function is not required to be implemented as it falls back to the begin send block function
     /// but it is highly recommended to be implemented for performance reasons as we probably are IO bound
     fn begin_send_joined_block(

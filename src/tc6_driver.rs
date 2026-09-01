@@ -44,6 +44,78 @@ unsafe impl ReadBuffer for DMAPtr {
 enum TC6DriverState {
     Idle,
     WaitingForTransmitComplete,
+    /// A control-mode register read/write (TC6 spec Section 7.4) is in flight over SPI.
+    WaitingForControlComplete,
+}
+
+/// Largest number of consecutive registers one control transaction issued by this driver may
+/// touch. The TC6 `LEN` field allows up to 128; this is just the size of the driver's static
+/// scratch buffers (`4 * (CONTROL_MAX_REGS + 2)` bytes each for MOSI and MISO).
+pub const CONTROL_MAX_REGS: usize = 8;
+
+/// Byte length of a control transaction touching `CONTROL_MAX_REGS` registers:
+/// 4-byte header + `n` data words + 4-byte trailing don't-care word (TC6 spec Figures 13/14).
+const CONTROL_BUF_LEN: usize = 4 * (CONTROL_MAX_REGS + 2);
+
+/// Error from the register read/write entry points on [`TC6HighPrio`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlError<E> {
+    /// A control transaction is already pending or in flight; retry once it has completed
+    /// (poll [`TC6HighPrio::take_control_result`]).
+    Busy,
+    /// The requested register count is zero or exceeds [`CONTROL_MAX_REGS`].
+    UnsupportedCount,
+    /// The underlying interface failed to start the transfer.
+    Interface(E),
+}
+
+/// A register read/write request accepted but not yet put on the wire.
+struct PendingControl {
+    /// `true` = write (WNR = 1), `false` = read.
+    write: bool,
+    /// Memory Map Selector (TC6 spec Table 6).
+    mms: u8,
+    /// Address of the first register within the selected memory map.
+    addr: u16,
+    /// Number of consecutive registers, `1..=CONTROL_MAX_REGS`.
+    count: u8,
+    /// Write data, `values[..count]` used for writes; ignored for reads.
+    values: [u32; CONTROL_MAX_REGS],
+}
+
+/// Bookkeeping for the control transaction currently on the wire.
+struct ControlInFlight {
+    write: bool,
+    count: u8,
+}
+
+/// Result of a completed control transaction, taken via [`TC6HighPrio::take_control_result`].
+pub struct ControlResult {
+    /// The control command header echoed back by the MAC-PHY (MISO bytes `[4..8)`).
+    pub echoed_header: tc6_header::ControlHeader,
+    /// `true` if the MAC-PHY flagged the command header as bad (HDRB set, or the echoed header
+    /// failed its parity check - e.g. the `0xC0000001` error code from spec Section 7.5.1). No
+    /// register access was performed; the host should retry the transaction.
+    pub header_bad: bool,
+    /// `true` if this was a write.
+    pub write: bool,
+    values: [u32; CONTROL_MAX_REGS],
+    count: u8,
+}
+
+impl ControlResult {
+    /// The register values.
+    ///
+    /// For a read these are the values read back. For a write these are the *echoed* write data
+    /// words the MAC-PHY returned, which the host can compare against what it sent to spot bus
+    /// errors (TC6 spec Section 7.4.4). Empty when [`header_bad`](Self::header_bad) is set.
+    pub fn values(&self) -> &[u32] {
+        if self.header_bad {
+            &[]
+        } else {
+            &self.values[..self.count as usize]
+        }
+    }
 }
 
 /// Implemented by the application to wake the high-priority side when the low-priority side has
@@ -72,6 +144,12 @@ where
     scratch_buffer: [u8; 68], // used for temporary storage of a block in the case where a block needs to be moved
     rx_ready_producer: Producer<'static, Box<RxP>>, // frames pulled off the wire, handed to the low-prio side
     tx_ready_consumer: Consumer<'static, Box<TxP>>, // frames built by the low-prio side, waiting to go out over SPI
+    // --- command mode (register read/write, TC6 spec Section 7.4) ---
+    pending_control: Option<PendingControl>, // accepted request, not yet on the wire
+    control_in_flight: Option<ControlInFlight>, // request currently being transferred over SPI
+    last_control_result: Option<ControlResult>, // completed transaction, waiting to be taken
+    control_tx_buffer: [u8; CONTROL_BUF_LEN],   // MOSI: header + write data + trailing don't-care
+    control_rx_buffer: [u8; CONTROL_BUF_LEN],   // MISO: don't-care + echoed header + data
 }
 
 /// Owned by the low-priority context (e.g. `idle`): implements `smoltcp::phy::Device`.
@@ -120,6 +198,11 @@ where
             rx_ready_producer,
             tx_ready_consumer,
             extra_start_buffer: None,
+            pending_control: None,
+            control_in_flight: None,
+            last_control_result: None,
+            control_tx_buffer: [0; CONTROL_BUF_LEN],
+            control_rx_buffer: [0; CONTROL_BUF_LEN],
         },
         TC6LowPrio {
             rx_ready_consumer,
@@ -147,6 +230,13 @@ where
                 TC6DriverState::WaitingForTransmitComplete => {
                     if self.interface.transfer_complete()? {
                         self.handle_transmit_complete()?;
+                    } else {
+                        break;
+                    }
+                }
+                TC6DriverState::WaitingForControlComplete => {
+                    if self.interface.transfer_complete()? {
+                        self.handle_control_complete()?;
                     } else {
                         break;
                     }
@@ -294,6 +384,13 @@ where
     }
 
     fn handle_idle(&mut self) -> Result<(), T::Error> {
+        // A queued register read/write takes priority over data chunks: command mode is how the
+        // host configures the chip in the first place (set CONFIG0.SYNC etc.), and while a
+        // control transaction is pending we must not start a data transfer.
+        if self.pending_control.is_some() {
+            return self.start_control_transaction();
+        }
+
         // do we have a receive buffer ready to fill? if not allocate one from the pool and queue it up for the tc6 chip to fill
         if self.current_receive_buffer.is_none() {
             // TODO make sure the compiler is smart and avoids a hugely expensive copy/move of the FrameBuffer struct here, since it is a large array. It should be optimized away by the compiler, but we should check.
@@ -407,6 +504,157 @@ where
             // irq fired, but we have no data to send nor space to receive data
             todo!("what should we do here?")
         }
+        Ok(())
+    }
+
+    // --- command mode: register read / write (TC6 spec Section 7.4) ---
+
+    /// `true` if a control transaction is pending or in flight, i.e. the register read/write
+    /// entry points would return [`ControlError::Busy`].
+    pub fn control_busy(&self) -> bool {
+        self.pending_control.is_some()
+            || self.control_in_flight.is_some()
+            || matches!(self.driver_state, TC6DriverState::WaitingForControlComplete)
+    }
+
+    /// Take the result of the last completed control transaction, if one is waiting.
+    pub fn take_control_result(&mut self) -> Option<ControlResult> {
+        self.last_control_result.take()
+    }
+
+    /// Queue a read of `count` consecutive registers starting at `addr` within memory map `mms`
+    /// (see `crate::registers` for the standard map and its addresses). The address
+    /// post-increments per register (TC6 `AID` = 0). Pump [`on_interrupt`](Self::on_interrupt)
+    /// until [`take_control_result`](Self::take_control_result) returns the values.
+    pub fn begin_register_read(
+        &mut self,
+        mms: u8,
+        addr: u16,
+        count: u8,
+    ) -> Result<(), ControlError<T::Error>> {
+        self.queue_control(PendingControl {
+            write: false,
+            mms,
+            addr,
+            count,
+            values: [0; CONTROL_MAX_REGS],
+        })
+    }
+
+    /// Queue a write of `values` to consecutive registers starting at `addr` within memory map
+    /// `mms`. The address post-increments per register (TC6 `AID` = 0). At most
+    /// [`CONTROL_MAX_REGS`] values.
+    pub fn begin_register_write(
+        &mut self,
+        mms: u8,
+        addr: u16,
+        values: &[u32],
+    ) -> Result<(), ControlError<T::Error>> {
+        if values.is_empty() || values.len() > CONTROL_MAX_REGS {
+            return Err(ControlError::UnsupportedCount);
+        }
+        let mut buf = [0u32; CONTROL_MAX_REGS];
+        buf[..values.len()].copy_from_slice(values);
+        self.queue_control(PendingControl {
+            write: true,
+            mms,
+            addr,
+            count: values.len() as u8,
+            values: buf,
+        })
+    }
+
+    fn queue_control(&mut self, req: PendingControl) -> Result<(), ControlError<T::Error>> {
+        if self.control_busy() {
+            return Err(ControlError::Busy);
+        }
+        if req.count == 0 || req.count as usize > CONTROL_MAX_REGS {
+            return Err(ControlError::UnsupportedCount);
+        }
+        self.pending_control = Some(req);
+        // If the state machine is otherwise idle, kick it now so callers that don't wire up an
+        // interrupt source (e.g. a blocking init loop) still make progress. Otherwise it is
+        // picked up by `handle_idle` once the in-flight transfer finishes.
+        if matches!(self.driver_state, TC6DriverState::Idle) {
+            self.handle_idle().map_err(ControlError::Interface)?;
+        }
+        Ok(())
+    }
+
+    /// Lay the pending request out in `control_tx_buffer` and hand it to the interface.
+    fn start_control_transaction(&mut self) -> Result<(), T::Error> {
+        let req = self
+            .pending_control
+            .take()
+            .expect("start_control_transaction called with no pending request");
+        let n = req.count as usize;
+        // header (4B) + n data words + trailing don't-care word (4B), see spec Figures 13/14.
+        let total = 4 * (n + 2);
+
+        let header = tc6_header::ControlHeader::new()
+            .with_wnr(req.write)
+            .with_mms(req.mms)
+            .with_addr(req.addr)
+            .with_len(req.count - 1) // LEN is register count minus one
+            .with_correct_parity();
+
+        self.control_tx_buffer[..total].fill(0);
+        self.control_tx_buffer[0..4].copy_from_slice(&header.to_bytes());
+        if req.write {
+            for (i, word) in req.values[..n].iter().enumerate() {
+                self.control_tx_buffer[4 + 4 * i..8 + 4 * i]
+                    .copy_from_slice(&word.to_be_bytes());
+            }
+        }
+        self.control_rx_buffer[..total].fill(0);
+
+        let tx = DMAPtr::from_slice(&mut self.control_tx_buffer[..total]);
+        let rx = DMAPtr::from_slice(&mut self.control_rx_buffer[..total]);
+        self.interface.begin_control_transaction(tx, rx)?;
+
+        self.control_in_flight = Some(ControlInFlight {
+            write: req.write,
+            count: req.count,
+        });
+        self.driver_state = TC6DriverState::WaitingForControlComplete;
+        Ok(())
+    }
+
+    /// Parse the MISO stream of a finished control transaction into a [`ControlResult`].
+    fn handle_control_complete(&mut self) -> Result<(), T::Error> {
+        let in_flight = self
+            .control_in_flight
+            .take()
+            .expect("handle_control_complete called with no transaction in flight");
+        let n = in_flight.count as usize;
+
+        // MISO layout: [0..4) don't-care, [4..8) echoed control header, [8..) echoed/read words.
+        let echoed_header = tc6_header::ControlHeader::from_bytes(
+            self.control_rx_buffer[4..8].try_into().unwrap(),
+        );
+        // On a header parity error the MAC-PHY streams the 0xC0000001 error code where the
+        // echoed header would be (spec Section 7.5.1); it decodes to HDRB = 1, so this catches
+        // both that and an ordinary bad-header echo.
+        let header_bad = echoed_header.hdrb() || !echoed_header.parity_ok();
+
+        let mut values = [0u32; CONTROL_MAX_REGS];
+        if !header_bad {
+            for (i, slot) in values[..n].iter_mut().enumerate() {
+                let off = 8 + 4 * i;
+                *slot = u32::from_be_bytes(
+                    self.control_rx_buffer[off..off + 4].try_into().unwrap(),
+                );
+            }
+        }
+
+        self.last_control_result = Some(ControlResult {
+            echoed_header,
+            header_bad,
+            write: in_flight.write,
+            values,
+            count: in_flight.count,
+        });
+        self.driver_state = TC6DriverState::Idle;
         Ok(())
     }
 }
@@ -593,15 +841,75 @@ mod driver_tests {
         result_len: usize,
     }
 
+    /// One control transaction the driver handed to the interface.
+    struct ControlTxn {
+        /// full MOSI snapshot (header + write data + trailing don't-care word)
+        tx: Vec<u8>,
+        /// where the driver wants the MISO stream written back
+        result_ptr: *mut u8,
+        result_len: usize,
+    }
+
     #[derive(Default)]
     struct SpyInterface {
         chunks: Vec<Chunk>,
+        control_txns: Vec<ControlTxn>,
         complete: bool,
     }
 
     impl SpyInterface {
         fn last(&self) -> &Chunk {
             self.chunks.last().expect("no chunk sent yet")
+        }
+
+        fn last_control(&self) -> &ControlTxn {
+            self.control_txns.last().expect("no control txn sent yet")
+        }
+
+        /// Play the MAC-PHY side of a control *read*: echo the command header the driver sent
+        /// into MISO bytes `[4..8)` and place `values` after it, then raise "transfer complete".
+        fn respond_control_read(&mut self, values: &[u32]) {
+            let t = self.control_txns.last().expect("no control txn sent yet");
+            let (ptr, len) = (t.result_ptr, t.result_len);
+            let mut echoed_header = [0u8; 4];
+            echoed_header.copy_from_slice(&t.tx[0..4]);
+            assert!(len >= 8 + 4 * values.len());
+            // SAFETY: same rationale as `respond` - the driver is blocked on completion so the
+            // buffer it handed us is still alive and un-aliased.
+            let buf = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+            buf.fill(0);
+            buf[4..8].copy_from_slice(&echoed_header);
+            for (i, v) in values.iter().enumerate() {
+                buf[8 + 4 * i..12 + 4 * i].copy_from_slice(&v.to_be_bytes());
+            }
+            self.complete = true;
+        }
+
+        /// Play the MAC-PHY side of a control *write*: echo the command header and echo the
+        /// write-data words straight back (spec Section 7.4.4), then raise "transfer complete".
+        fn respond_control_write(&mut self) {
+            let t = self.control_txns.last().expect("no control txn sent yet");
+            let (ptr, len) = (t.result_ptr, t.result_len);
+            // MOSI = [4B header][4*n write data][4B don't-care]; echo header + the n data words.
+            let n = len / 4 - 2;
+            let mut echo = Vec::new();
+            echo.extend_from_slice(&t.tx[0..4 + 4 * n]);
+            let buf = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+            buf.fill(0);
+            buf[4..4 + echo.len()].copy_from_slice(&echo);
+            self.complete = true;
+        }
+
+        /// Play a header parity error: the MAC-PHY streams the `0xC0000001` error code (spec
+        /// Section 7.5.1) for every word from the second onward, then raises completion.
+        fn respond_control_bad_header(&mut self) {
+            let t = self.control_txns.last().expect("no control txn sent yet");
+            let (ptr, len) = (t.result_ptr, t.result_len);
+            let buf = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+            for word in buf.chunks_exact_mut(4).skip(1) {
+                word.copy_from_slice(&0xC000_0001u32.to_be_bytes());
+            }
+            self.complete = true;
         }
 
         /// Pretend the MAC-PHY filled in the MISO buffer of the most recent chunk:
@@ -670,6 +978,24 @@ mod driver_tests {
                 header: u32::from_be_bytes(hdr),
                 data: snap,
                 joined: true,
+                result_ptr: rptr,
+                result_len: rlen,
+            });
+            Ok(())
+        }
+
+        fn begin_control_transaction(
+            &mut self,
+            tx: impl ReadBuffer<Word = u8>,
+            mut rx: impl WriteBuffer<Word = u8>,
+        ) -> Result<(), Self::Error> {
+            let (dptr, dlen) = unsafe { tx.read_buffer() };
+            let (rptr, rlen) = unsafe { rx.write_buffer() };
+            assert_eq!(dlen, rlen, "control tx/rx buffers must match length");
+            assert!(dlen >= 12 && dlen % 4 == 0, "at least header + 1 word + pad");
+            let tx = unsafe { core::slice::from_raw_parts(dptr, dlen) }.to_vec();
+            self.control_txns.push(ControlTxn {
+                tx,
                 result_ptr: rptr,
                 result_len: rlen,
             });
@@ -750,6 +1076,16 @@ mod driver_tests {
             result: impl WriteBuffer<Word = u8>,
         ) -> Result<(), Self::Error> {
             self.inner.begin_send_joined_block(data, result)?;
+            self.polls_until_done = 2;
+            Ok(())
+        }
+
+        fn begin_control_transaction(
+            &mut self,
+            tx: impl ReadBuffer<Word = u8>,
+            rx: impl WriteBuffer<Word = u8>,
+        ) -> Result<(), Self::Error> {
+            self.inner.begin_control_transaction(tx, rx)?;
             self.polls_until_done = 2;
             Ok(())
         }
@@ -1022,6 +1358,13 @@ mod driver_tests {
             }
             fn transfer_complete(&mut self) -> Result<bool, Self::Error> {
                 Ok(true)
+            }
+            fn begin_control_transaction(
+                &mut self,
+                _tx: impl ReadBuffer<Word = u8>,
+                _rx: impl WriteBuffer<Word = u8>,
+            ) -> Result<(), Self::Error> {
+                unreachable!("this test does not exercise control transactions")
             }
         }
 
@@ -1367,5 +1710,208 @@ mod driver_tests {
             lo.receive(Instant::ZERO).is_none(),
             "only the one frame was received"
         );
+    }
+
+    // --------------------------------------------------------------------------------------
+    // high-priority side: command mode (register read / write, TC6 spec Section 7.4)
+    // --------------------------------------------------------------------------------------
+
+    /// A single-register read builds a control command header (DNC = 0, WNR = 0, LEN = 0) and
+    /// hands the MAC-PHY-echoed value back through `take_control_result`.
+    #[test]
+    fn register_read_single_builds_header_and_returns_value() {
+        setup!(hi, _lo, SpyInterface::default(), NoopSignal);
+
+        hi.begin_register_read(0, 0x0002, 1).expect("accepted");
+        assert!(hi.control_busy());
+        assert!(matches!(
+            hi.driver_state,
+            TC6DriverState::WaitingForControlComplete
+        ));
+
+        // header on the wire
+        let sent = tc6_header::ControlHeader::from_bytes(
+            hi.interface.last_control().tx[0..4].try_into().unwrap(),
+        );
+        assert!(!sent.dnc(), "DNC = 0 marks a control command");
+        assert!(!sent.wnr(), "a read");
+        assert_eq!(sent.mms(), 0);
+        assert_eq!(sent.addr(), 0x0002);
+        assert_eq!(sent.len(), 0, "LEN is (register count - 1)");
+        assert!(sent.parity_ok());
+        assert_eq!(
+            hi.interface.last_control().tx.len(),
+            4 * (1 + 2),
+            "header + 1 word + trailing don't-care"
+        );
+
+        hi.interface.respond_control_read(&[0x1234_5678]);
+        hi.handle_control_complete().unwrap();
+        assert!(matches!(hi.driver_state, TC6DriverState::Idle));
+        assert!(!hi.control_busy());
+
+        let res = hi.take_control_result().expect("a result is waiting");
+        assert!(!res.write);
+        assert!(!res.header_bad);
+        assert_eq!(res.values(), &[0x1234_5678]);
+        assert_eq!(res.echoed_header.addr(), 0x0002);
+        assert!(hi.take_control_result().is_none(), "result taken once");
+    }
+
+    /// A write sets WNR = 1, puts the data words after the header, and the echoed write data
+    /// comes back for the host to verify (spec Section 7.4.4).
+    #[test]
+    fn register_write_puts_data_after_header_and_echoes_it() {
+        setup!(hi, _lo, SpyInterface::default(), NoopSignal);
+
+        hi.begin_register_write(0, 0x0004, &[0xDEAD_BEEF]).expect("accepted");
+
+        let txn = hi.interface.last_control();
+        let sent = tc6_header::ControlHeader::from_bytes(txn.tx[0..4].try_into().unwrap());
+        assert!(!sent.dnc());
+        assert!(sent.wnr(), "a write");
+        assert_eq!(sent.addr(), 0x0004);
+        assert_eq!(sent.len(), 0);
+        assert!(sent.parity_ok());
+        assert_eq!(&txn.tx[4..8], &0xDEAD_BEEFu32.to_be_bytes(), "data word follows header");
+
+        hi.interface.respond_control_write();
+        hi.handle_control_complete().unwrap();
+
+        let res = hi.take_control_result().expect("result");
+        assert!(res.write);
+        assert!(!res.header_bad);
+        assert_eq!(res.values(), &[0xDEAD_BEEF], "echoed write data");
+        assert!(res.echoed_header.wnr());
+    }
+
+    /// Reading several consecutive registers in one transaction: LEN = count - 1, and every
+    /// value word from the MISO stream is returned in order.
+    #[test]
+    fn register_read_multiple_consecutive() {
+        setup!(hi, _lo, SpyInterface::default(), NoopSignal);
+
+        hi.begin_register_read(0, 0x0000, 3).expect("accepted");
+        let sent = tc6_header::ControlHeader::from_bytes(
+            hi.interface.last_control().tx[0..4].try_into().unwrap(),
+        );
+        assert_eq!(sent.len(), 2, "3 registers -> LEN = 2");
+        assert_eq!(hi.interface.last_control().tx.len(), 4 * (3 + 2));
+
+        hi.interface.respond_control_read(&[0x0000_0011, 0x0000_0011, 0xAABB_CCDD]);
+        hi.handle_control_complete().unwrap();
+
+        let res = hi.take_control_result().unwrap();
+        assert_eq!(res.values(), &[0x0000_0011, 0x0000_0011, 0xAABB_CCDD]);
+    }
+
+    /// If the MAC-PHY flags the command header as bad (it streams `0xC0000001` where the echoed
+    /// header would be), the result carries `header_bad` and no register values.
+    #[test]
+    fn control_header_bad_is_surfaced_and_yields_no_values() {
+        setup!(hi, _lo, SpyInterface::default(), NoopSignal);
+
+        hi.begin_register_read(0, 0x0002, 1).expect("accepted");
+        hi.interface.respond_control_bad_header();
+        hi.handle_control_complete().unwrap();
+
+        let res = hi.take_control_result().expect("result");
+        assert!(res.header_bad);
+        assert!(res.values().is_empty());
+        assert!(matches!(hi.driver_state, TC6DriverState::Idle));
+    }
+
+    /// While a transaction is pending/in flight, another request is rejected with `Busy`
+    /// rather than clobbering the first.
+    #[test]
+    fn second_control_request_while_busy_is_rejected() {
+        setup!(hi, _lo, SpyInterface::default(), NoopSignal);
+
+        hi.begin_register_read(0, 0x0002, 1).expect("first accepted");
+        assert!(matches!(
+            hi.begin_register_read(0, 0x0003, 1),
+            Err(ControlError::Busy)
+        ));
+        assert!(matches!(
+            hi.begin_register_write(0, 0x0004, &[0]),
+            Err(ControlError::Busy)
+        ));
+
+        // once it completes, the interface is free again
+        hi.interface.respond_control_read(&[0]);
+        hi.handle_control_complete().unwrap();
+        let _ = hi.take_control_result();
+        assert!(hi.begin_register_read(0, 0x0003, 1).is_ok());
+    }
+
+    #[test]
+    fn control_rejects_bad_register_counts() {
+        setup!(hi, _lo, SpyInterface::default(), NoopSignal);
+
+        assert!(matches!(
+            hi.begin_register_read(0, 0, 0),
+            Err(ControlError::UnsupportedCount)
+        ));
+        assert!(matches!(
+            hi.begin_register_read(0, 0, CONTROL_MAX_REGS as u8 + 1),
+            Err(ControlError::UnsupportedCount)
+        ));
+        assert!(matches!(
+            hi.begin_register_write(0, 0, &[]),
+            Err(ControlError::UnsupportedCount)
+        ));
+        assert!(matches!(
+            hi.begin_register_write(0, 0, &[0u32; CONTROL_MAX_REGS + 1]),
+            Err(ControlError::UnsupportedCount)
+        ));
+    }
+
+    /// Driven purely through the public `on_interrupt` pump: the transaction looks in-flight
+    /// for one poll (SpyInterface's completion flag is edge-triggered), then completes.
+    #[test]
+    fn register_read_completes_through_on_interrupt() {
+        setup!(hi, _lo, SpyInterface::default(), NoopSignal);
+
+        hi.begin_register_read(0, 0x0002, 1).expect("accepted");
+
+        // transfer not done yet -> loop takes its `transfer_complete() == false` exit
+        hi.on_interrupt().unwrap();
+        assert!(hi.take_control_result().is_none());
+        assert!(hi.control_busy());
+
+        hi.interface.respond_control_read(&[0x0000_00A5]);
+        hi.on_interrupt().unwrap();
+
+        let res = hi.take_control_result().expect("result after completion");
+        assert_eq!(res.values(), &[0x0000_00A5]);
+    }
+
+    /// A queued register read is serviced ahead of a waiting transmit frame.
+    #[test]
+    fn pending_control_is_serviced_before_data() {
+        setup!(hi, lo, SpyInterface::default(), NoopSignal);
+
+        // a frame is waiting to go out...
+        {
+            let tok = lo.transmit(Instant::ZERO).expect("tx token");
+            tok.consume(64, |b| b.copy_from_slice(&ethernet_like(64)));
+        }
+        // ...but a control read is queued first
+        hi.begin_register_read(0, 0x0004, 1).expect("accepted");
+        assert!(matches!(
+            hi.driver_state,
+            TC6DriverState::WaitingForControlComplete
+        ));
+        assert_eq!(hi.interface.chunks.len(), 0, "no data chunk yet");
+        assert_eq!(hi.interface.control_txns.len(), 1);
+
+        hi.interface.respond_control_read(&[0]);
+        hi.handle_control_complete().unwrap();
+        let _ = hi.take_control_result();
+
+        // now the transmit frame goes out
+        hi.on_transmit_ready().unwrap();
+        assert_eq!(hi.interface.chunks.len(), 1);
+        assert!(tc6_header::TransmitHeader::from_raw(hi.interface.chunks[0].header).dv());
     }
 }
