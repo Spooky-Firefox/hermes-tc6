@@ -155,10 +155,12 @@ pub enum TimestampSize {
 /// [`Config::default`] is the minimal safe setup: unprotected control, >= 1 transmit credit
 /// before IRQn, no cut-through, no timestamps, every maskable interrupt masked. The chunk
 /// payload size is always forced to 64 bytes - the data path assumes it.
+//
+// TODO: `CONFIG0.PROTE` (protected control transfers - each 32-bit word sent with its ones'
+// complement, spec 7.4.4) is not offered here yet: the control path in `start_control_transaction`
+// / `handle_control_complete` only does unprotected single-word transfers.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
-    /// `CONFIG0.PROTE` - transfer each control word with its complement for error detection.
-    pub protected: bool,
     /// `CONFIG0.TXCTHRESH`.
     pub tx_credit_threshold: TxCreditThreshold,
     /// `CONFIG0.TXCTE` - cut-through from the SPI host to the network. Requires `STDCAP.CTC`.
@@ -179,7 +181,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            protected: false,
             tx_credit_threshold: TxCreditThreshold::One,
             cut_through_tx: false,
             cut_through_rx: false,
@@ -866,7 +867,6 @@ where
         // 4. write CONFIG0 with the driver's required 64-byte chunk payload and SYNC = 1
         let mut c0 = Config0::from_raw(0)
             .with_cps(6) // 2^6 = 64-byte data chunk payload
-            .with_prote(cfg.protected)
             .with_txcte(cfg.cut_through_tx)
             .with_rxcte(cfg.cut_through_rx)
             .with_txcthresh(cfg.tx_credit_threshold.bits());
@@ -2423,7 +2423,6 @@ mod driver_tests {
     fn configure_applies_optional_features() {
         setup!(hi, _lo, RegDouble::new(), NoopSignal);
         let cfg = Config {
-            protected: true,
             tx_credit_threshold: TxCreditThreshold::Eight,
             cut_through_rx: true,
             timestamp: Some(TimestampSize::Bits64),
@@ -2432,7 +2431,6 @@ mod driver_tests {
         hi.configure(&cfg).expect("bring-up ok");
 
         let c0 = registers::Config0::from_raw(hi.interface.reg(0, 0x0004));
-        assert!(c0.prote());
         assert!(c0.rxcte());
         assert!(!c0.txcte());
         assert_eq!(c0.txcthresh(), 0b10);
@@ -2541,6 +2539,31 @@ mod driver_tests {
             dev.read_reg(0, 0x000C),
             registers::IMask0::RESET_VALUE.raw(),
             "IMASK0 programmed"
+        );
+    }
+
+    /// End to end: when `fake_tc6` streams the `0xC0000001` header-error code (spec 7.5.1),
+    /// the driver surfaces `header_bad` with no register values.
+    #[test]
+    fn control_header_parity_error_surfaced_through_fake_tc6() {
+        use crate::embeded_io_implementation::EmbeddedHalImplementation;
+        use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
+
+        let mut spi = FakeTc6SpiDevice::new();
+        spi.device.force_bad_control_header = true;
+        setup!(hi, _lo, EmbeddedHalImplementation::new(spi), NoopSignal);
+
+        hi.begin_register_read(0, 0x0002, 1).expect("queued");
+        // EmbeddedHalImplementation runs the transfer synchronously; finish it by hand
+        hi.handle_control_complete().unwrap();
+
+        let res = hi.take_control_result().expect("result");
+        assert!(res.header_bad);
+        assert!(res.values().is_empty());
+        // the chip latched STATUS0.HDRE (bit 5)
+        assert_ne!(
+            hi.interface.inner_mut().device.read_reg(0, 0x0008) & (1 << 5),
+            0
         );
     }
 

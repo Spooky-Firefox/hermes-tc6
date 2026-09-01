@@ -95,6 +95,9 @@ pub struct FakeTc6Device {
     // MOSI bytes seen so far in the current Command-mode transaction, so write data can be
     // echoed back (spec Section 7.4.4) and applied once each 32-bit word is complete.
     command_mosi: vec::Vec<u8>,
+    // Test knob: force the *next* control transaction to be treated as a bad header (as if a
+    // parity error was detected), regardless of the header actually sent. One-shot.
+    pub force_bad_control_header: bool,
 }
 
 impl FakeTc6Device {
@@ -111,6 +114,7 @@ impl FakeTc6Device {
             receive_footer: ReceiveFooter::new(),
             regs_mms0: [0; MMS0_REGS],
             command_mosi: Vec::new(),
+            force_bad_control_header: false,
         };
         dev.reset_registers();
         dev
@@ -341,7 +345,17 @@ impl FakeTc6Device {
 
         self.command_mosi.push(byte);
 
-        let out = if i < 4 {
+        // Odd parity over the whole 32-bit header (spec 8.5.2): a valid header has an odd
+        // popcount. `force_bad_control_header` lets a test inject the error path unconditionally.
+        let header_raw = u32::from_be_bytes(self.mosi_header_raw);
+        let header_bad = self.force_bad_control_header || header_raw.count_ones() % 2 == 0;
+
+        let out = if header_bad {
+            // spec 7.5.1: assert STATUS0.HDRE and stream the constant 0xC0000001 for every
+            // 32-bit word from the echoed-header position onward until CSn is deasserted.
+            self.regs_mms0[0x08] |= 1 << 5; // STATUS0.HDRE
+            0xC000_0001u32.to_be_bytes()[i % 4]
+        } else if i < 4 {
             // echoed control command header
             self.mosi_header_raw[i]
         } else {
@@ -375,6 +389,7 @@ impl FakeTc6Device {
 
         if i + 1 >= cmd_len {
             self.command_mosi.clear();
+            self.force_bad_control_header = false; // one-shot
             self.mode = ReadingHeader(0);
         } else {
             self.mode = Command(i + 1);
