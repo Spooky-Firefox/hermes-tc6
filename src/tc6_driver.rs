@@ -198,13 +198,27 @@ pub struct Config {
     pub cut_through_tx: bool,
     /// `CONFIG0.RXCTE` - cut-through from the network to the SPI host. Requires `STDCAP.CTC`.
     pub cut_through_rx: bool,
-    /// `Some` enables `CONFIG0.FTSE` and picks the width via `FTSS`. Requires `STDCAP.FTSC`.
+    /// `Some` would enable `CONFIG0.FTSE` and pick the width via `FTSS` (requires `STDCAP.FTSC`).
+    ///
+    /// **Not implemented yet:** an enabled receive timestamp is prepended to the frame data and
+    /// `SWO` points at it, but the receive path ignores the footer's `RTSA` / `RTSP` bits and
+    /// would treat those timestamp bytes as frame content. Until it strips them,
+    /// [`configure`](TC6HighPrio::configure) rejects a `Some` here with
+    /// [`ConfigError::NotImplemented`].
     pub timestamp: Option<TimestampSize>,
     /// `Some` sets this node's PLCA ID / node count and enables PLCA; `None` leaves the PHY's
     /// PLCA registers untouched (strap defaults / plain CSMA/CD).
     pub plca: Option<PlcaConfig>,
     /// Value written to `IMASK0`. Defaults to [`registers::IMask0::RESET_VALUE`].
     pub interrupt_mask: registers::IMask0,
+    /// Assert `RESET.SWRESET` as the first step of [`configure`](TC6HighPrio::configure), before
+    /// waiting for `STATUS0.RESETC`. Defaults to `true`.
+    ///
+    /// `SYNC` only clears on a reset, so after an MCU-only reboot (PHY still powered and already
+    /// configured) a `configure` that skipped this would find `RESETC` already clear and fail
+    /// with [`ConfigError::ResetNotComplete`]. Set `false` only if the caller guarantees the
+    /// MAC-PHY was just hardware-reset / power-cycled and issues its own reset otherwise.
+    pub software_reset: bool,
     /// Max busy-wait iterations for a single control transfer to report complete before
     /// [`configure`](TC6HighPrio::configure) gives up with [`ConfigError::Timeout`].
     pub transfer_poll_limit: u32,
@@ -221,6 +235,7 @@ impl Default for Config {
             timestamp: None,
             plca: None,
             interrupt_mask: registers::IMask0::RESET_VALUE,
+            software_reset: true,
             transfer_poll_limit: 100_000,
             reset_poll_limit: 64,
         }
@@ -240,6 +255,10 @@ pub enum ConfigError<E> {
     BadVersion { major: u8, minor: u8 },
     /// A requested feature is not advertised in `STDCAP` (the `&str` names it).
     Unsupported(&'static str),
+    /// A requested feature is advertised by the chip but this driver does not implement it yet
+    /// (the `&str` names it). Enabling it anyway would corrupt the data path, so `configure`
+    /// refuses rather than half-wiring it.
+    NotImplemented(&'static str),
     /// `CONFIG0` read-back did not show `SYNC` set with a 64-byte chunk payload.
     SyncFailed,
     /// The MAC-PHY rejected a control command header (parity error / HDRB).
@@ -283,6 +302,18 @@ where
     // Set by `configure`; cleared if a receive footer ever reports SYNC = 0 (the chip reset
     // itself and lost its configuration, spec Section 7.7 - the host must re-run `configure`).
     sync_established: bool,
+    // Most recent `RCA` (receive chunks available) copied out of a data-chunk footer: how many
+    // more receive chunks the MAC-PHY has buffered right now (TC6 spec Section 7.7). Drives
+    // `on_interrupt`'s drain loop - keep issuing chunks while this is > 0, stop at 0 and wait for
+    // the next interrupt. Refreshed from every footer; stale-low at worst (new frames since the
+    // last footer just get picked up on the next interrupt).
+    rx_chunks_available: u8,
+    // Most recent `TXC` (transmit credits) copied out of a data-chunk footer: how many transmit
+    // chunks the MAC-PHY can still accept before `STATUS0.TXBOE`. `on_interrupt` will not keep
+    // draining for transmit while this is 0. Between footers it can only be stale-low (the chip's
+    // transmit buffer only drains while the host is not sending), so gating on it never causes an
+    // overflow, only a slightly delayed send.
+    tx_credits: u8,
 }
 
 /// Owned by the low-priority context (e.g. `idle`): implements `smoltcp::phy::Device`.
@@ -348,6 +379,8 @@ where
             control_tx_buffer: [0; CONTROL_BUF_LEN],
             control_rx_buffer: [0; CONTROL_BUF_LEN],
             sync_established: false,
+            rx_chunks_available: 0,
+            tx_credits: 0,
         },
         TC6LowPrio {
             rx_ready_consumer,
@@ -391,13 +424,40 @@ where
     RxP: BoxPool<Data = FrameBuffer<M>> + 'static,
     TxP: BoxPool<Data = FrameBuffer<M>> + 'static,
 {
-    // Call this from every interrupt source the chip/interface can raise: the TC6 chip's own IRQ
-    // pin *and* whatever signals SPI/DMA transfer completion (often a separate vector). This is
-    // re-entrant/idempotent — it just re-checks `driver_mode` / `interface.transfer_complete()`
-    // rather than assuming which source triggered it, so spurious or overlapping calls are fine.
+    /// Service the chip. Call this from every interrupt source the chip/interface can raise: the
+    /// TC6 chip's own IRQ pin *and* whatever signals SPI/DMA transfer completion (often a separate
+    /// vector). It is re-entrant/idempotent - it just re-checks `driver_state` /
+    /// [`Tc6Interface::transfer_complete`] rather than assuming which source triggered it, so
+    /// spurious or overlapping calls are fine.
+    ///
+    /// # Draining and interface requirements
+    ///
+    /// One `on_interrupt` call services the chip until there is nothing left to do: after each
+    /// chunk completes the footer's `RCA` (receive chunks available) and `TXC` (transmit credits)
+    /// are read, and the loop keeps issuing chunks while the MAC-PHY still has receive data
+    /// buffered or the host has a transmit chunk it has credit to send (TC6 spec Section 7.7).
+    /// When both are exhausted it returns and waits for the next interrupt.
+    ///
+    /// The loop also yields whenever [`Tc6Interface::transfer_complete`] reports a transfer still
+    /// in flight (`Ok(false)`), which is how a DMA/async interface hands control back between
+    /// chunks; the next completion interrupt re-enters here. A **fully blocking** interface (e.g.
+    /// the ready-made `EmbeddedHalImplementation`, whose `transfer_complete` is hard-coded `true`)
+    /// never yields that way, so a genuinely long receive burst is drained inside a single call -
+    /// capped at [`Self::MAX_INTERRUPT_STEPS`] chunks, after which it returns and resumes on the
+    /// next interrupt.
     pub fn on_interrupt(&mut self) -> Result<(), T::Error> {
         // we might have a frame to receive
+        let mut steps = 0u32;
         loop {
+            if steps >= Self::MAX_INTERRUPT_STEPS {
+                warn!(
+                    "tc6: on_interrupt hit its {}-step cap (blocking interface draining a long \
+                     burst, or a burst larger than the cap) - resuming on the next interrupt",
+                    Self::MAX_INTERRUPT_STEPS
+                );
+                break;
+            }
+            steps += 1;
             match self.driver_state {
                 TC6DriverState::Idle => {
                     self.handle_idle()?;
@@ -410,6 +470,14 @@ where
                 TC6DriverState::WaitingForTransmitComplete => {
                     if self.interface.transfer_complete()? {
                         self.handle_transmit_complete()?;
+                        // `handle_transmit_complete` refreshed `rx_chunks_available` /
+                        // `tx_credits` from the footer. Stop here unless the chip still has
+                        // receive data or a credited transmit is waiting - otherwise a blocking
+                        // interface would re-arm a pointless receive poll every step until the
+                        // cap (spec Section 7.7: stop reading at RCA = 0).
+                        if !self.data_path_has_work() {
+                            break;
+                        }
                     } else {
                         break;
                     }
@@ -417,6 +485,9 @@ where
                 TC6DriverState::WaitingForControlComplete => {
                     if self.interface.transfer_complete()? {
                         self.handle_control_complete()?;
+                        if !self.data_path_has_work() {
+                            break;
+                        }
                     } else {
                         break;
                     }
@@ -424,6 +495,44 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Upper bound on chunks [`on_interrupt`](Self::on_interrupt) will service in one call before
+    /// returning (it resumes on the next interrupt). With a DMA/async interface the loop yields
+    /// well before this via [`Tc6Interface::transfer_complete`]; the cap only bites when a fully
+    /// blocking interface is draining a long receive burst in one go. The 5-bit footer `RCA`
+    /// field tops out at 31, so 64 covers a maximal burst plus interleaved transmit chunks.
+    pub const MAX_INTERRUPT_STEPS: u32 = 64;
+
+    /// Whether [`on_interrupt`](Self::on_interrupt) should issue another data chunk rather than
+    /// stop and wait for the next interrupt (TC6 spec Section 7.7): a queued control transaction
+    /// always counts; otherwise keep going while the MAC-PHY still has receive chunks buffered
+    /// (`RCA` > 0), a multi-block receive frame is half-reassembled, or a transmit chunk is
+    /// waiting and the chip has a credit for it (`TXC` > 0).
+    fn data_path_has_work(&self) -> bool {
+        if self.pending_control.is_some() {
+            return true;
+        }
+        if !self.sync_established {
+            return false;
+        }
+        if self.rx_chunks_available > 0 {
+            return true;
+        }
+        if self
+            .current_receive_buffer
+            .as_ref()
+            .is_some_and(|b| !b.as_slice().is_empty())
+        {
+            // partway through reassembling a multi-block receive frame
+            return true;
+        }
+        if self.tx_credits > 0
+            && (self.current_transmit_buffer.is_some() || !self.tx_ready_consumer.is_empty())
+        {
+            return true;
+        }
+        false
     }
 
     // This should be called whenever the low-prio side may have queued a frame to transmit:
@@ -494,6 +603,10 @@ where
 
             footer = tc6_footer::ReceiveFooter::from_bytes(bytes[64..68].try_into().unwrap());
         }
+        // Every footer carries the chip's live RCA / TXC counters; refresh our copies so the
+        // `on_interrupt` drain loop knows whether to keep going (spec Section 7.7).
+        self.rx_chunks_available = footer.rca();
+        self.tx_credits = footer.txc();
         // Every receive footer mirrors CONFIG0.SYNC. Losing it after bring-up means the chip
         // reset itself; flag that the host needs to re-run `configure` (spec Section 7.7).
         if self.sync_established && !footer.sync() {
@@ -565,15 +678,21 @@ where
         }
 
         if frame_done {
-            let len = self
-                .current_receive_buffer
-                .as_ref()
-                .map(|f| f.as_slice().len())
-                .unwrap_or(0);
-            trace!("tc6: received frame complete ({} bytes), handing to low-prio", len);
-            self.rx_ready_producer
-                .enqueue(self.current_receive_buffer.take().unwrap())
-                .unwrap();
+            let frame = self.current_receive_buffer.take().unwrap();
+            // Frame Drop (spec Section 7.3.7): the MAC-PHY sets FD at end-of-frame when the frame
+            // must be discarded (e.g. it overflowed the receive buffer). FD is only meaningful
+            // with EV = 1, which is exactly the `frame_done` case. Free the buffer instead of
+            // handing a truncated/corrupt frame up to smoltcp.
+            if footer.fd() {
+                warn!("tc6: receive footer FD=1 - dropping this frame ({} bytes)", frame.as_slice().len());
+                // `frame` drops here, returning its block to the pool
+            } else {
+                trace!(
+                    "tc6: received frame complete ({} bytes), handing to low-prio",
+                    frame.as_slice().len()
+                );
+                self.rx_ready_producer.enqueue(frame).unwrap();
+            }
         }
         Ok(())
     }
@@ -716,9 +835,11 @@ where
             self.interface.begin_send_joined_block(data, result)?;
             self.driver_state = TC6DriverState::WaitingForTransmitComplete;
         } else {
-            // irq fired, but we have no data to send nor space to receive data
-            error!("tc6: handle_idle with nothing to send and no rx buffer - unhandled state");
-            todo!("what should we do here?")
+            // Nothing queued to transmit and the receive pool is exhausted (no buffer to point
+            // the chip at). Don't churn the bus with NORX polls: the MAC-PHY keeps any pending
+            // receive data and holds IRQn asserted, so we retry on the next interrupt or once the
+            // low-priority side frees a buffer. Staying `Idle` lets `on_interrupt` break out.
+            trace!("tc6: handle_idle - nothing to transmit and rx pool empty, deferring");
         }
         Ok(())
     }
@@ -903,6 +1024,7 @@ where
 
     /// Run the mandatory bring-up sequence, busy-polling each control transfer to completion:
     ///
+    /// 0. if `cfg.software_reset`, assert `RESET.SWRESET`,
     /// 1. wait for `STATUS0.RESETC` (reset complete),
     /// 2. sanity-check `IDVER`,
     /// 3. gate requested features on `STDCAP`,
@@ -918,13 +1040,27 @@ where
     /// source wired up yet. On [`ConfigError::Timeout`] the state machine is returned to idle,
     /// but a genuinely stuck transfer may still be running on the interface.
     pub fn configure(&mut self, cfg: &Config) -> Result<(), ConfigError<T::Error>> {
-        use registers::{addr, mms, Config0, IdVer, Status0, StdCap};
+        use registers::{addr, mms, Config0, IdVer, Reset, Status0, StdCap};
 
         info!("tc6: configure() starting bring-up");
 
         if self.control_busy() {
             warn!("tc6: configure() called while a control transaction is busy");
             return Err(ConfigError::Busy);
+        }
+
+        // 0. software reset. SYNC only clears on a reset, so without this an MCU-only reboot
+        //    (PHY still configured, RESETC already clear) would never satisfy step 1. The reset
+        //    takes effect once CSn deasserts at the end of this control write (spec 9.2.4);
+        //    step 1 then polls RESETC back to 1.
+        if cfg.software_reset {
+            debug!("tc6: configure() asserting RESET.SWRESET");
+            self.write_reg_blocking(
+                mms::STANDARD,
+                addr::RESET,
+                Reset::SWRESET.raw(),
+                cfg.transfer_poll_limit,
+            )?;
         }
 
         // 1. reset complete?
@@ -978,23 +1114,27 @@ where
             warn!("tc6: cut-through requested but STDCAP.CTC is not set");
             return Err(ConfigError::Unsupported("cut-through"));
         }
-        if cfg.timestamp.is_some() && !cap.ftsc() {
-            warn!("tc6: frame timestamps requested but STDCAP.FTSC is not set");
-            return Err(ConfigError::Unsupported("frame timestamp"));
+        if cfg.timestamp.is_some() {
+            if !cap.ftsc() {
+                warn!("tc6: frame timestamps requested but STDCAP.FTSC is not set");
+                return Err(ConfigError::Unsupported("frame timestamp"));
+            }
+            // The RX path does not strip the prepended receive timestamp yet (footer RTSA/RTSP
+            // are ignored), so enabling FTSE would feed timestamp bytes to smoltcp as frame
+            // data. Refuse rather than corrupt every received frame.
+            warn!("tc6: frame timestamps requested but the receive path does not handle RTSA yet");
+            return Err(ConfigError::NotImplemented("frame timestamp"));
         }
 
-        // 4. write CONFIG0 with the driver's required 64-byte chunk payload and SYNC = 1
-        let mut c0 = Config0::from_raw(0)
+        // 4. write CONFIG0 with the driver's required 64-byte chunk payload and SYNC = 1.
+        //    FTSE/FTSS are intentionally left clear - `cfg.timestamp` is rejected above until the
+        //    receive path can strip the prepended timestamp.
+        let c0 = Config0::from_raw(0)
             .with_cps(6) // 2^6 = 64-byte data chunk payload
             .with_txcte(cfg.cut_through_tx)
             .with_rxcte(cfg.cut_through_rx)
-            .with_txcthresh(cfg.tx_credit_threshold.bits());
-        if let Some(size) = cfg.timestamp {
-            c0 = c0
-                .with_ftse(true)
-                .with_ftss(matches!(size, TimestampSize::Bits64));
-        }
-        c0 = c0.with_sync(true);
+            .with_txcthresh(cfg.tx_credit_threshold.bits())
+            .with_sync(true);
         self.write_reg_blocking(
             mms::STANDARD,
             addr::CONFIG0,
@@ -1058,6 +1198,12 @@ where
             )?;
         }
 
+        // The chip's transmit buffer is empty right after bring-up, so there is at least one
+        // credit; seed optimistically so the first transmit chunk can go out before any footer
+        // has been seen. `rx_chunks_available` stays 0 - the first receive poll of a burst is
+        // driven by a fresh interrupt, not by this counter.
+        self.rx_chunks_available = 0;
+        self.tx_credits = 1;
         self.sync_established = true;
         info!("tc6: configure() complete - CONFIG0.SYNC established, data path live");
         Ok(())
@@ -1984,6 +2130,42 @@ mod driver_tests {
         );
     }
 
+    /// When the end-of-frame footer has FD (Frame Drop) set the frame is discarded, not handed
+    /// to the low-priority side, and the receive buffer is freed for reuse (spec Section 7.3.7).
+    #[test]
+    fn receive_footer_frame_drop_discards_the_frame() {
+        setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true; // data-path test: pretend configure() ran
+
+        hi.handle_idle().unwrap();
+
+        let frame = ethernet_like(20);
+        let footer = crate::tc6_footer::ReceiveFooter::new()
+            .with_dv(true)
+            .with_sv(true)
+            .with_swo(0)
+            .with_ev(true)
+            .with_ebo(frame.len() as u8 - 1)
+            .with_fd(true)
+            .with_correct_parity();
+        hi.interface.respond(&frame, footer);
+
+        hi.handle_transmit_complete().unwrap();
+        assert!(matches!(hi.driver_state, TC6DriverState::Idle));
+        assert!(
+            hi.current_receive_buffer.is_none(),
+            "dropped frame's buffer was released"
+        );
+        assert!(
+            lo.receive(Instant::ZERO).is_none(),
+            "a dropped frame is never surfaced to smoltcp"
+        );
+
+        // the driver keeps running: the next chunk still gets a fresh receive buffer
+        hi.handle_idle().unwrap();
+        assert!(hi.current_receive_buffer.is_some());
+    }
+
     #[test]
     fn receive_only_chunk_targets_the_receive_buffer_tail() {
         setup!(hi, _lo, SpyInterface::default(), NoopSignal);
@@ -2099,6 +2281,76 @@ mod driver_tests {
         );
     }
 
+    /// A fully blocking interface (`transfer_complete` always `true`) whose footer forever
+    /// reports `RCA` > 0 would drain without end; `on_interrupt` must bound itself at
+    /// `MAX_INTERRUPT_STEPS` and return so the caller (and lower-priority work) is not starved.
+    #[test]
+    fn on_interrupt_is_bounded_when_the_footer_always_reports_more_chunks() {
+        /// Always "done", always "31 more receive chunks available", never any frame data.
+        #[derive(Default)]
+        struct AlwaysMoreRx {
+            chunks_issued: u32,
+        }
+        impl AlwaysMoreRx {
+            fn fill_footer(result: &mut (impl WriteBuffer<Word = u8> + ?Sized)) {
+                let (ptr, len) = unsafe { result.write_buffer() };
+                assert_eq!(len, 68);
+                let buf = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+                buf.fill(0);
+                let footer = crate::tc6_footer::ReceiveFooter::new()
+                    .with_sync(true)
+                    .with_rca(31)
+                    .with_correct_parity();
+                buf[64..68].copy_from_slice(&footer.to_bytes());
+            }
+        }
+        impl Tc6Interface for AlwaysMoreRx {
+            type Error = core::convert::Infallible;
+            fn begin_send_block(
+                &mut self,
+                _h: u32,
+                _d: impl ReadBuffer<Word = u8>,
+                mut result: impl WriteBuffer<Word = u8>,
+            ) -> Result<(), Self::Error> {
+                self.chunks_issued += 1;
+                Self::fill_footer(&mut result);
+                Ok(())
+            }
+            fn begin_send_joined_block(
+                &mut self,
+                _d: impl ReadBuffer<Word = u8>,
+                mut result: impl WriteBuffer<Word = u8>,
+            ) -> Result<(), Self::Error> {
+                self.chunks_issued += 1;
+                Self::fill_footer(&mut result);
+                Ok(())
+            }
+            fn transfer_complete(&mut self) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+            fn begin_control_transaction(
+                &mut self,
+                _tx: impl ReadBuffer<Word = u8>,
+                _rx: impl WriteBuffer<Word = u8>,
+            ) -> Result<(), Self::Error> {
+                unreachable!("no control traffic in this test")
+            }
+        }
+
+        setup!(hi, _lo, AlwaysMoreRx::default(), NoopSignal);
+        hi.sync_established = true; // data-path test: pretend configure() ran
+
+        hi.on_interrupt().expect("returns rather than hanging");
+
+        // 64 loop steps alternate issue-chunk / handle-completion -> ~half are chunks.
+        let cap = TC6HighPrio::<AlwaysMoreRx, RxPool, TxPool, M, NQ>::MAX_INTERRUPT_STEPS;
+        let issued = hi.interface.chunks_issued;
+        assert!(
+            issued > 0 && issued <= cap,
+            "bounded by the {cap}-step cap, got {issued}"
+        );
+    }
+
     // --------------------------------------------------------------------------------------
     // regression pins for known-broken paths (see module-level notes / PR discussion)
     // --------------------------------------------------------------------------------------
@@ -2158,13 +2410,14 @@ mod driver_tests {
     }
 
     /// Once a single-block frame's chunk completes, `handle_transmit_complete` advances the
-    /// cursor past the frame length and drops `current_transmit_buffer`, so it is not
-    /// re-sent. The follow-up `handle_idle` inside `on_interrupt` then issues a *receive*
-    /// poll (joined chunk, DV = 0), not another copy of the frame.
+    /// cursor past the frame length and drops `current_transmit_buffer`, so it is not re-sent.
+    /// The completing footer reports `RCA = 0` and nothing else is queued, so `on_interrupt`
+    /// stops there - it does not spin issuing receive polls.
     #[test]
-    fn transmit_frame_is_sent_once_then_driver_polls_for_receive() {
+    fn transmit_frame_is_sent_once_then_driver_stops_when_rca_zero() {
         setup!(hi, lo, SpyInterface::default(), NoopSignal);
         hi.sync_established = true; // data-path test: pretend configure() ran
+        hi.tx_credits = 1;
 
         let payload = ethernet_like(64);
         {
@@ -2175,6 +2428,7 @@ mod driver_tests {
         assert_eq!(hi.interface.chunks.len(), 1);
         assert!(!hi.interface.chunks[0].joined);
 
+        // footer: DV = 0, RCA = 0, TXC = 0 -> nothing more for the chip to do
         hi.interface.respond(
             &[],
             crate::tc6_footer::ReceiveFooter::new().with_correct_parity(),
@@ -2186,10 +2440,59 @@ mod driver_tests {
             "tx buffer freed once the whole frame is on the wire"
         );
         assert_eq!(hi.current_transmit_buffer_cursor, 0);
-        // the only extra chunk is the receive poll, and it does not carry the frame again
-        assert_eq!(hi.interface.chunks.len(), 2);
+        assert_eq!(
+            hi.interface.chunks.len(),
+            1,
+            "no extra receive poll - the drain loop stopped at RCA = 0"
+        );
+        assert!(matches!(hi.driver_state, TC6DriverState::Idle));
+    }
+
+    /// When the completing footer reports `RCA > 0` the drain loop keeps going: `on_interrupt`
+    /// issues a follow-up receive poll (joined chunk, DV = 0), not another copy of the transmit
+    /// frame. (The edge-triggered spy then reports the follow-up still in flight, so the call
+    /// returns; a real burst would drain over successive completion interrupts.)
+    #[test]
+    fn transmit_completion_with_rca_set_triggers_a_receive_poll() {
+        setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true; // data-path test: pretend configure() ran
+        hi.tx_credits = 1;
+
+        let payload = ethernet_like(64);
+        {
+            let tok = lo.transmit(Instant::ZERO).unwrap();
+            tok.consume(64, |buf| buf.copy_from_slice(&payload));
+        }
+        hi.on_transmit_ready().unwrap();
+        assert_eq!(hi.interface.chunks.len(), 1);
+
+        // the chip still has a receive chunk buffered (RCA = 1)
+        hi.interface.respond(
+            &[],
+            crate::tc6_footer::ReceiveFooter::new()
+                .with_rca(1)
+                .with_correct_parity(),
+        );
+        hi.on_interrupt().unwrap();
+
+        assert!(hi.current_transmit_buffer.is_none(), "frame sent once");
+        assert_eq!(
+            hi.interface.chunks.len(),
+            2,
+            "RCA > 0 -> a follow-up receive poll was issued"
+        );
         assert!(hi.interface.chunks[1].joined);
         assert!(!tc6_header::TransmitHeader::from_raw(hi.interface.chunks[1].header).dv());
+        assert_eq!(hi.rx_chunks_available, 1, "RCA copied out of the footer");
+
+        // drain the follow-up poll: footer now reports RCA = 0, so the loop settles
+        hi.interface.respond(
+            &[],
+            crate::tc6_footer::ReceiveFooter::new().with_correct_parity(),
+        );
+        hi.on_interrupt().unwrap();
+        assert_eq!(hi.interface.chunks.len(), 2, "no further polls once RCA = 0");
+        assert!(matches!(hi.driver_state, TC6DriverState::Idle));
     }
 
     // --------------------------------------------------------------------------------------
@@ -2629,7 +2932,6 @@ mod driver_tests {
         let cfg = Config {
             tx_credit_threshold: TxCreditThreshold::Eight,
             cut_through_rx: true,
-            timestamp: Some(TimestampSize::Bits64),
             ..Config::default()
         };
         hi.configure(&cfg).expect("bring-up ok");
@@ -2638,8 +2940,60 @@ mod driver_tests {
         assert!(c0.rxcte());
         assert!(!c0.txcte());
         assert_eq!(c0.txcthresh(), 0b10);
-        assert!(c0.ftse() && c0.ftss());
+        assert!(!c0.ftse() && !c0.ftss(), "timestamps stay off");
         assert!(c0.sync());
+    }
+
+    /// `Config::timestamp` is accepted by the type system but the receive path can't strip the
+    /// prepended timestamp yet, so `configure` refuses it (even though `RegDouble`'s STDCAP
+    /// advertises FTSC) rather than half-wiring FTSE and corrupting every received frame.
+    #[test]
+    fn configure_rejects_timestamp_until_rx_path_supports_it() {
+        setup!(hi, _lo, RegDouble::new(), NoopSignal);
+        let cfg = Config {
+            timestamp: Some(TimestampSize::Bits64),
+            ..Config::default()
+        };
+        assert!(matches!(
+            hi.configure(&cfg),
+            Err(ConfigError::NotImplemented("frame timestamp"))
+        ));
+        assert!(!hi.is_configured());
+        assert!(!registers::Config0::from_raw(hi.interface.reg(0, 0x0004)).ftse());
+    }
+
+    /// With `software_reset` set (the default), `configure` asserts `RESET.SWRESET` as its very
+    /// first control write, before it starts polling `STATUS0.RESETC`.
+    #[test]
+    fn configure_asserts_swreset_first_by_default() {
+        setup!(hi, _lo, RegDouble::new(), NoopSignal);
+        hi.configure(&Config::default()).expect("bring-up ok");
+
+        let first = hi.interface.writes.first().copied().expect("a write happened");
+        assert_eq!(
+            first,
+            (0, registers::addr::RESET, registers::Reset::SWRESET.raw()),
+            "SWRESET is the first register written"
+        );
+    }
+
+    /// `software_reset = false` skips the `RESET.SWRESET` write entirely.
+    #[test]
+    fn configure_skips_swreset_when_disabled() {
+        setup!(hi, _lo, RegDouble::new(), NoopSignal);
+        let cfg = Config {
+            software_reset: false,
+            ..Config::default()
+        };
+        hi.configure(&cfg).expect("bring-up ok");
+
+        assert!(
+            !hi.interface
+                .writes
+                .iter()
+                .any(|&(_, addr, _)| addr == registers::addr::RESET),
+            "RESET register never written"
+        );
     }
 
     #[test]
