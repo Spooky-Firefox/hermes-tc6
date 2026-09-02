@@ -297,8 +297,8 @@ where
     pending_control: Option<PendingControl>, // accepted request, not yet on the wire
     control_in_flight: Option<ControlInFlight>, // request currently being transferred over SPI
     last_control_result: Option<ControlResult>, // completed transaction, waiting to be taken
-    control_tx_buffer: [u8; CONTROL_BUF_LEN],   // MOSI: header + write data + trailing don't-care
-    control_rx_buffer: [u8; CONTROL_BUF_LEN],   // MISO: don't-care + echoed header + data
+    control_tx_buffer: [u8; CONTROL_BUF_LEN], // MOSI: header + write data + trailing don't-care
+    control_rx_buffer: [u8; CONTROL_BUF_LEN], // MISO: don't-care + echoed header + data
     // Set by `configure`; cleared if a receive footer ever reports SYNC = 0 (the chip reset
     // itself and lost its configuration, spec Section 7.7 - the host must re-run `configure`).
     sync_established: bool,
@@ -314,6 +314,10 @@ where
     // transmit buffer only drains while the host is not sending), so gating on it never causes an
     // overflow, only a slightly delayed send.
     tx_credits: u8,
+    // Latched when a data-chunk footer reports `EXST = 1` (a STATUS0/STATUS1 bit is set and
+    // unmasked, spec Section 7.3.7 / 7.7). Cleared by `service_extended_status`, which reads
+    // STATUS0 and write-1-to-clears it, and by `configure`.
+    extended_status_pending: bool,
 }
 
 /// Owned by the low-priority context (e.g. `idle`): implements `smoltcp::phy::Device`.
@@ -354,8 +358,7 @@ where
 {
     debug!(
         "tc6: split() - M={}, NQ={}, driver starts unconfigured",
-        M,
-        NQ
+        M, NQ
     );
 
     let (rx_ready_producer, rx_ready_consumer) = rx_ready.split();
@@ -381,6 +384,7 @@ where
             sync_established: false,
             rx_chunks_available: 0,
             tx_credits: 0,
+            extended_status_pending: false,
         },
         TC6LowPrio {
             rx_ready_consumer,
@@ -548,61 +552,80 @@ where
     }
 
     fn handle_transmit_complete(&mut self) -> Result<(), T::Error> {
-        let footer;
-        {
-            let bytes = if let (Some(_transmit_frame), Some(receive_frame)) = (
-                self.current_transmit_buffer.as_mut(),
-                self.current_receive_buffer.as_mut(),
-            ) {
-                // read the footer
-                // Safety: before this function can be called, we have started a block send and the transfer has completed,
-                // so the tc6 chip should have populated the 68 bytes at the end of the receive frame
-                // that we sent in handle idle, so we can read the footer from the receive frame
+        // Copy the 4 footer bytes out of this chunk's MISO region: the 68-byte window past the
+        // in-flight receive frame's data, or the scratch buffer for a transmit-only /
+        // rx-pool-exhausted chunk.
+        let footer_bytes: [u8; 4] = {
+            let region: &mut [u8] = if let Some(receive_frame) =
+                self.current_receive_buffer.as_mut()
+            {
+                // Safety: a block send has completed, so the chip has written 64 payload + 4
+                // footer bytes into the 68 bytes past the frame's initialized data.
                 unsafe { receive_frame.get_mut_at_end(68) }
-            } else if self.current_transmit_buffer.as_mut().is_some() {
-                // read the footer
+            } else if self.current_transmit_buffer.is_some() {
                 &mut self.scratch_buffer
-            } else if let Some(receive_frame) = self.current_receive_buffer.as_mut() {
-                // read the footer
-                // Safety: before this function can be called, we have started a block send and the transfer has completed,
-                // so the tc6 chip should have populated the 68 bytes at the end of the receive frame
-                // that we sent in handle idle, so we can read the footer from the receive frame
-                unsafe { receive_frame.get_mut_at_end(68) }
             } else {
                 unreachable!(
-                    "how did we get here? We can't have a transfer complete without either the goal of reading (Some(ReceiveFrame)), or writing (Some(TransmitFrame)) or both, so this should not happen"
+                    "transfer completed with neither a receive frame to fill nor a transmit frame in flight"
                 )
             };
+            region[64..68].try_into().unwrap()
+        };
+        let footer = tc6_footer::ReceiveFooter::from_bytes(footer_bytes);
 
-            if self.current_transmit_buffer.is_some() {
-                let cursor = self.current_transmit_buffer_cursor;
-                // A continuation block (cursor != 0) was sent as a joined header+data chunk,
-                // which meant overwriting the 4 real frame bytes at [cursor-4, cursor) with
-                // the chunk header. Those bytes were already transmitted in the previous
-                // block, but restore them from `scratch_header` so the frame stays intact
-                // (needed if it ever has to be retransmitted).
-                if cursor != 0 {
-                    let frame = self.current_transmit_buffer.as_mut().unwrap();
-                    frame.as_mut_slice()[cursor - 4..cursor].copy_from_slice(&self.scratch_header);
-                }
+        // TC6 spec 7.5.1: on a transmit-header parity error the MAC-PHY streams the constant
+        // 0xC0000001 (HDRB = 1, EXST = 1, valid odd parity) from the second 32-bit word onward
+        // in place of the footer, and ignores the chunk. Bit errors on MISO instead surface as
+        // a failed footer parity check. Either way nothing in the footer is trustworthy and the
+        // chunk was not accepted: leave the transmit cursor where it is so the same block is
+        // re-issued by the next `handle_idle`, and don't touch RCA / TXC / SYNC / EXST / DV.
+        // Restore any real frame bytes borrowed to carry a joined continuation header first.
+        if !footer.parity_ok() || footer.hdrb() {
+            warn!(
+                "tc6: data chunk footer rejected (parity_ok={}, hdrb={}) - re-issuing chunk",
+                footer.parity_ok(),
+                footer.hdrb()
+            );
+            // cursor is only non-zero while a multi-block transmit is in flight
+            let cursor = self.current_transmit_buffer_cursor;
+            if cursor != 0
+                && let Some(frame) = self.current_transmit_buffer.as_mut()
+            {
+                frame.as_mut_slice()[cursor - 4..cursor].copy_from_slice(&self.scratch_header);
+            }
+            self.driver_state = TC6DriverState::Idle;
+            return Ok(());
+        }
 
-                self.current_transmit_buffer_cursor += 64;
-                // if we have reached the end of the current transmit buffer drop/free the transmit box
-                if self.current_transmit_buffer_cursor
-                    >= self
-                        .current_transmit_buffer
-                        .as_ref()
-                        .unwrap()
-                        .as_slice()
-                        .len()
-                {
-                    self.current_transmit_buffer = None;
-                    self.current_transmit_buffer_cursor = 0;
-                }
+        // Footer trustworthy from here on: the transmit chunk was accepted, so advance past it
+        // (restoring the 4 bytes a joined continuation header borrowed) and free the frame once
+        // its last block has gone out.
+        if self.current_transmit_buffer.is_some() {
+            let cursor = self.current_transmit_buffer_cursor;
+            // A continuation block (cursor != 0) was sent as a joined header+data chunk, which
+            // meant overwriting the 4 real frame bytes at [cursor-4, cursor) with the chunk
+            // header. Those bytes were already transmitted in the previous block; restore them
+            // from `scratch_header` so the frame stays intact (needed for any retransmit).
+            if cursor != 0 {
+                let frame = self.current_transmit_buffer.as_mut().unwrap();
+                frame.as_mut_slice()[cursor - 4..cursor].copy_from_slice(&self.scratch_header);
             }
 
-            footer = tc6_footer::ReceiveFooter::from_bytes(bytes[64..68].try_into().unwrap());
+            self.current_transmit_buffer_cursor += 64;
+            // if we have reached the end of the current transmit buffer drop/free the transmit box
+            if self.current_transmit_buffer_cursor
+                >= self
+                    .current_transmit_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_slice()
+                    .len()
+            {
+                self.current_transmit_buffer = None;
+                self.current_transmit_buffer_cursor = 0;
+            }
         }
+
         // Every footer carries the chip's live RCA / TXC counters; refresh our copies so the
         // `on_interrupt` drain loop knows whether to keep going (spec Section 7.7).
         self.rx_chunks_available = footer.rca();
@@ -613,6 +636,17 @@ where
             warn!("tc6: receive footer reports SYNC=0 - MAC-PHY reset itself, re-run configure()");
             self.sync_established = false;
         }
+        // Extended status (spec Section 7.3.7 / 7.7): a STATUS0 / STATUS1 bit is set and
+        // unmasked. Latch it so the application can run `service_extended_status()` (a control
+        // read of STATUS0 + write-1-to-clear) from a context where blocking control I/O is OK.
+        if footer.exst() {
+            if !self.extended_status_pending {
+                warn!(
+                    "tc6: data footer EXST=1 - STATUS0 needs servicing (call service_extended_status)"
+                );
+            }
+            self.extended_status_pending = true;
+        }
         if footer.dv() {
             self.handle_data_valid(footer)?;
         }
@@ -621,58 +655,85 @@ where
     }
 
     fn handle_data_valid(&mut self, footer: ReceiveFooter) -> Result<(), T::Error> {
-        // if we did not have a receive frame, then we have sent the norx flag with the header,
-        // and therefore the tc6 should not have set dv.
-        // but if it did either we messed up and did not set the norx flag, or the tc6 chip is misbehaving, either way we should panic.
-        assert!(self.current_receive_buffer.is_some());
-        let receive_frame = self.current_receive_buffer.as_mut().unwrap();
-        // if receive frame is empty,
-        let frame_done: bool;
-        if receive_frame.as_slice().is_empty() {
-            if footer.sv() {
-                unsafe { receive_frame.set_start((footer.swo() << 2) as usize) };
-                if footer.ev() {
-                    unsafe {
-                        receive_frame.add_len(footer.ebo() as usize + 1 - footer.swo() as usize * 4)
-                    }
-                    frame_done = true;
-                } else {
-                    unsafe { receive_frame.add_len(64 - footer.swo() as usize * 4) };
-                    frame_done = false;
-                }
-            } else {
-                error!(
-                    "tc6: DV set on a fresh receive frame but SV is not - MAC-PHY framing broken"
-                );
-                panic!(
-                    "we are expecting a start valid bit, as data valid is set and we are beginning a new frame (indicated by empty receive frame), but the start valid bit is not set, this should not happen"
-                );
-            }
+        // If we have no receive buffer we sent NORX = 1 (rx pool exhausted) and the chip should
+        // have returned DV = 0. A DV = 1 here means a footer bit error slipped past the parity
+        // check or the chip is desynced - drop the chunk rather than unwrap a `None`.
+        if self.current_receive_buffer.is_none() {
+            warn!("tc6: footer DV=1 with no receive buffer (NORX chunk / desync) - dropping chunk");
+            return Ok(());
+        }
+
+        let sv = footer.sv();
+        let ev = footer.ev();
+        // SWO is 4 bits (start <= 60) and EBO is 6 bits (end <= 64), so these can't themselves
+        // run off a 64-byte payload; the checks below are about ordering and buffer capacity.
+        let start = footer.swo() as usize * 4;
+        let end = footer.ebo() as usize + 1;
+        let (fresh, spare) = {
+            let f = self.current_receive_buffer.as_ref().unwrap();
+            (f.as_slice().is_empty(), f.spare_capacity())
+        };
+
+        // Reject footer field combinations the framing rules forbid (spec 7.3.7 / 7.3.8.1) or
+        // that would not fit the receive buffer, instead of feeding them to an unchecked
+        // `add_len` / `get_mut_at_end` that would panic. In every case the in-progress frame is
+        // unrecoverable, so drop it and wait for the next SV.
+        let bail = if fresh && !sv {
+            Some("DV=1 SV=0 on a fresh receive frame (data valid without start)")
+        } else if fresh && ev && end <= start {
+            Some("end-of-frame offset at or before start-of-frame offset")
+        } else if !fresh && sv && !ev {
+            Some("SV=1 EV=0 mid-frame (repeated frame start)")
+        } else if !fresh && sv && ev && footer.ebo() >= footer.swo() * 4 {
+            Some("frame concatenation with EBO >= 4*SWO (overlapping frames)")
+        } else if !fresh && sv && spare < 64 {
+            Some("this frame plus the next frame's start would overflow the receive buffer")
+        } else if !fresh && ((ev && end > spare) || (!ev && spare < 64)) {
+            Some("received frame larger than the receive buffer")
         } else {
-            if footer.ev() && footer.sv() {
-                // if for some reason a new frame is started before the previous one is finished, we will panic, as this should not happen
-                assert!(footer.ebo() < footer.swo() * 4);
-            }
-            // note this is only valid if ev is set
-            if footer.sv() {
-                assert!(footer.ev());
+            None
+        };
+        if let Some(why) = bail {
+            warn!(
+                "tc6: receive framing rejected ({}) - dropping in-progress frame",
+                why
+            );
+            self.current_receive_buffer = None;
+            self.extra_start_buffer = None;
+            return Ok(());
+        }
 
-                // TODO possible optimization is to not write to temp buffer, and get box immediately.
-                self.extra_start_buffer = Some(
-                    heapless::Vec::from_slice(
-                        // would want to use bytes here but due to lifetimes i had to move it out of scope, so we have an extra unsafe block here
-                        &unsafe { receive_frame.get_mut_at_end(64) }[footer.swo() as usize * 4..],
-                    )
-                    .unwrap(),
-                );
-            }
-
-            if footer.ev() {
-                unsafe { receive_frame.add_len(footer.ebo() as usize + 1) }
+        let frame_done: bool;
+        if fresh {
+            // guarded above: SV is set, and when EV is set `start < end <= 64`.
+            let receive_frame = self.current_receive_buffer.as_mut().unwrap();
+            unsafe { receive_frame.set_start(start) };
+            if ev {
+                unsafe { receive_frame.add_len(end - start) };
                 frame_done = true;
             } else {
-                // dv is set, but ev and sv not set so whole block is valid and it's ok to add the whole block to the receive frame
-                unsafe { receive_frame.add_len(64) }
+                unsafe { receive_frame.add_len(64 - start) };
+                frame_done = false;
+            }
+        } else {
+            if sv {
+                // SV && EV here (guarded): this chunk carries the end of the current frame and
+                // the start of the next one. Stash the next frame's bytes so the following
+                // receive buffer starts with them. `spare >= 64` was checked above.
+                let receive_frame = self.current_receive_buffer.as_mut().unwrap();
+                let next_start = heapless::Vec::<u8, 64>::from_slice(
+                    &unsafe { receive_frame.get_mut_at_end(64) }[start..],
+                )
+                .unwrap();
+                self.extra_start_buffer = Some(next_start);
+            }
+            let receive_frame = self.current_receive_buffer.as_mut().unwrap();
+            if ev {
+                unsafe { receive_frame.add_len(end) };
+                frame_done = true;
+            } else {
+                // DV set, EV/SV clear: the whole 64-byte block is frame data.
+                unsafe { receive_frame.add_len(64) };
                 frame_done = false;
             }
         }
@@ -684,7 +745,10 @@ where
             // with EV = 1, which is exactly the `frame_done` case. Free the buffer instead of
             // handing a truncated/corrupt frame up to smoltcp.
             if footer.fd() {
-                warn!("tc6: receive footer FD=1 - dropping this frame ({} bytes)", frame.as_slice().len());
+                warn!(
+                    "tc6: receive footer FD=1 - dropping this frame ({} bytes)",
+                    frame.as_slice().len()
+                );
                 // `frame` drops here, returning its block to the pool
             } else {
                 trace!(
@@ -717,17 +781,23 @@ where
         if self.current_receive_buffer.is_none() {
             // TODO make sure the compiler is smart and avoids a hugely expensive copy/move of the FrameBuffer struct here, since it is a large array. It should be optimized away by the compiler, but we should check.
             self.current_receive_buffer = RxP::alloc(FrameBuffer::new()).ok();
-            if self.current_receive_buffer.is_none() {
-                warn!("tc6: rx pool exhausted - will send NORX and drop inbound data this chunk");
+            match self.current_receive_buffer.as_mut() {
+                Some(buf) => {
+                    // A stashed frame start from the previous chunk's tail (see
+                    // `handle_data_valid`) goes at the front of the fresh buffer.
+                    if let Some(start) = self.extra_start_buffer.take() {
+                        buf.push_slice(start.as_slice());
+                    }
+                }
+                None => {
+                    // Pool exhausted: this chunk goes out with NORX = 1 and inbound data is
+                    // dropped. Keep `extra_start_buffer` (if any) so the stashed frame start is
+                    // still prepended once a buffer frees up, rather than losing it here.
+                    warn!(
+                        "tc6: rx pool exhausted - sending NORX, dropping inbound data this chunk"
+                    );
+                }
             }
-            if let Some(buff) = self.extra_start_buffer.as_ref() {
-                self.current_receive_buffer
-                    .as_mut()
-                    .unwrap()
-                    .push_slice(buff.as_slice());
-            }
-            // TODO, maybe a option::take() would be better, but doing this way as im not sure if take would clone the inner vec.
-            self.extra_start_buffer = None;
         }
 
         if self.current_transmit_buffer.is_none() {
@@ -815,7 +885,10 @@ where
                 } else {
                     DMAPtr::from_slice(&mut self.scratch_buffer)
                 };
-                trace!("tc6: tx continuation chunk at cursor {} (ev={})", cursor, ev);
+                trace!(
+                    "tc6: tx continuation chunk at cursor {} (ev={})",
+                    cursor, ev
+                );
                 self.interface.begin_send_joined_block(data, result)?;
                 self.driver_state = TC6DriverState::WaitingForTransmitComplete;
             }
@@ -948,8 +1021,7 @@ where
         self.control_tx_buffer[0..4].copy_from_slice(&header.to_bytes());
         if req.write {
             for (i, word) in req.values[..n].iter().enumerate() {
-                self.control_tx_buffer[4 + 4 * i..8 + 4 * i]
-                    .copy_from_slice(&word.to_be_bytes());
+                self.control_tx_buffer[4 + 4 * i..8 + 4 * i].copy_from_slice(&word.to_be_bytes());
             }
         }
         self.control_rx_buffer[..total].fill(0);
@@ -975,9 +1047,8 @@ where
         let n = in_flight.count as usize;
 
         // MISO layout: [0..4) don't-care, [4..8) echoed control header, [8..) echoed/read words.
-        let echoed_header = tc6_header::ControlHeader::from_bytes(
-            self.control_rx_buffer[4..8].try_into().unwrap(),
-        );
+        let echoed_header =
+            tc6_header::ControlHeader::from_bytes(self.control_rx_buffer[4..8].try_into().unwrap());
         // On a header parity error the MAC-PHY streams the 0xC0000001 error code where the
         // echoed header would be (spec Section 7.5.1); it decodes to HDRB = 1, so this catches
         // both that and an ordinary bad-header echo.
@@ -996,9 +1067,8 @@ where
         if !header_bad {
             for (i, slot) in values[..n].iter_mut().enumerate() {
                 let off = 8 + 4 * i;
-                *slot = u32::from_be_bytes(
-                    self.control_rx_buffer[off..off + 4].try_into().unwrap(),
-                );
+                *slot =
+                    u32::from_be_bytes(self.control_rx_buffer[off..off + 4].try_into().unwrap());
             }
         }
 
@@ -1022,6 +1092,82 @@ where
         self.sync_established
     }
 
+    /// `true` if a data-chunk footer has reported `EXST = 1` (a `STATUS0` / `STATUS1` bit is set
+    /// and unmasked, spec Section 7.3.7) and [`service_extended_status`](Self::service_extended_status)
+    /// has not cleared it since.
+    pub fn extended_status_pending(&self) -> bool {
+        self.extended_status_pending
+    }
+
+    /// If a data-chunk footer has reported `EXST = 1` since the last call, do a blocking control
+    /// read of `STATUS0`, log every error/event bit that is set, write those bits back to clear
+    /// them (write-1-to-clear, spec Section 9.2.8), clear the pending latch, and return the
+    /// `STATUS0` snapshot. Returns `Ok(None)` when nothing is pending.
+    ///
+    /// TC6 spec Section 7.7: on `EXST` the host must control-read the status registers and act on
+    /// them. This handles `STATUS0`; a MAC-PHY that also raises `EXST` from `STATUS1` or vendor
+    /// registers needs the application to read those as well. The returned bits let the caller
+    /// react further (e.g. count `RXBOE` / `TXBOE`, or re-run [`configure`](Self::configure) if
+    /// the chip has clearly desynced).
+    ///
+    /// Like [`configure`](Self::configure) this busy-polls each control transfer and never enters
+    /// the data path, so it needs no interrupt source wired up - but it must be called with the
+    /// control path idle (no register op pending or in flight), otherwise it returns
+    /// [`ConfigError::Busy`].
+    pub fn service_extended_status(
+        &mut self,
+        poll_limit: u32,
+    ) -> Result<Option<registers::Status0>, ConfigError<T::Error>> {
+        use registers::{Status0, addr, mms};
+
+        if !self.extended_status_pending {
+            return Ok(None);
+        }
+        if self.control_busy() {
+            warn!("tc6: service_extended_status() called while the control path is busy");
+            return Err(ConfigError::Busy);
+        }
+
+        let raw = self.read_reg_blocking(mms::STANDARD, addr::STATUS0, poll_limit)?;
+        let s0 = Status0::from_raw(raw);
+        warn!("tc6: servicing extended status - STATUS0 = {:#010x}", raw);
+        if s0.txpe() {
+            warn!("tc6:   TXPE  - transmit protocol error (bad tx data chunk sequence)");
+        }
+        if s0.txboe() {
+            warn!("tc6:   TXBOE - transmit buffer overflow (frame dropped)");
+        }
+        if s0.txbue() {
+            warn!("tc6:   TXBUE - transmit buffer underflow (cut-through)");
+        }
+        if s0.rxboe() {
+            warn!("tc6:   RXBOE - receive buffer overflow (frame data lost)");
+        }
+        if s0.lofe() {
+            warn!("tc6:   LOFE  - loss of framing (CSn deasserted early)");
+        }
+        if s0.hdre() {
+            warn!("tc6:   HDRE  - header parity error");
+        }
+        if s0.txfcse() {
+            warn!("tc6:   TXFCSE - transmit FCS validation error");
+        }
+        if s0.cdpe() {
+            warn!("tc6:   CDPE  - control data protection error");
+        }
+
+        // Write-1-to-clear exactly the latched bits we just observed. PHYINT (read-only) and the
+        // reserved bits are outside DEFINED_MASK; RESETC and the TTSCAx capture-available bits
+        // clear too if they were set, which is fine here (timestamps are not enabled).
+        let clear = raw & Status0::DEFINED_MASK;
+        if clear != 0 {
+            self.write_reg_blocking(mms::STANDARD, addr::STATUS0, clear, poll_limit)?;
+        }
+
+        self.extended_status_pending = false;
+        Ok(Some(s0))
+    }
+
     /// Run the mandatory bring-up sequence, busy-polling each control transfer to completion:
     ///
     /// 0. if `cfg.software_reset`, assert `RESET.SWRESET`,
@@ -1040,7 +1186,7 @@ where
     /// source wired up yet. On [`ConfigError::Timeout`] the state machine is returned to idle,
     /// but a genuinely stuck transfer may still be running on the interface.
     pub fn configure(&mut self, cfg: &Config) -> Result<(), ConfigError<T::Error>> {
-        use registers::{addr, mms, Config0, IdVer, Reset, Status0, StdCap};
+        use registers::{Config0, IdVer, Reset, Status0, StdCap, addr, mms};
 
         info!("tc6: configure() starting bring-up");
 
@@ -1143,16 +1289,16 @@ where
         )?;
 
         // 5. confirm SYNC stuck (spec 7.6: once set it cannot be written back to 0)
-        let readback = Config0::from_raw(self.read_reg_blocking(
+        let read_back = Config0::from_raw(self.read_reg_blocking(
             mms::STANDARD,
             addr::CONFIG0,
             cfg.transfer_poll_limit,
         )?);
-        if !readback.sync() || readback.cps() != 6 {
+        if !read_back.sync() || read_back.cps() != 6 {
             error!(
                 "tc6: CONFIG0 read-back bad (sync={}, cps={}) - SYNC did not stick",
-                readback.sync(),
-                readback.cps()
+                read_back.sync(),
+                read_back.cps()
             );
             return Err(ConfigError::SyncFailed);
         }
@@ -1177,10 +1323,9 @@ where
         if let Some(p) = cfg.plca {
             debug!(
                 "tc6: enabling PLCA (node_id={}, node_count={})",
-                p.node_id,
-                p.node_count
+                p.node_id, p.node_count
             );
-            use registers::{plca, PlcaCtrl0, PlcaCtrl1};
+            use registers::{PlcaCtrl0, PlcaCtrl1, plca};
             self.write_reg_blocking(
                 mms::PHY_VS_PLCA,
                 plca::CTRL1,
@@ -1204,6 +1349,9 @@ where
         // driven by a fresh interrupt, not by this counter.
         self.rx_chunks_available = 0;
         self.tx_credits = 1;
+        // Step 7 above cleared STATUS0, so any EXST latched from a footer seen before bring-up is
+        // stale now.
+        self.extended_status_pending = false;
         self.sync_established = true;
         info!("tc6: configure() complete - CONFIG0.SYNC established, data path live");
         Ok(())
@@ -1228,8 +1376,7 @@ where
         if res.header_bad {
             warn!(
                 "tc6: MAC-PHY rejected control header for read mms={} addr={:#06x}",
-                mms,
-                addr
+                mms, addr
             );
             return Err(ConfigError::HeaderRejected);
         }
@@ -1258,8 +1405,7 @@ where
         if res.header_bad {
             warn!(
                 "tc6: MAC-PHY rejected control header for write mms={} addr={:#06x}",
-                mms,
-                addr
+                mms, addr
             );
             return Err(ConfigError::HeaderRejected);
         }
@@ -1608,17 +1754,17 @@ mod driver_tests {
             data: impl ReadBuffer<Word = u8>,
             mut result: impl WriteBuffer<Word = u8>,
         ) -> Result<(), Self::Error> {
-            let (dptr, dlen) = unsafe { data.read_buffer() };
-            assert_eq!(dlen, 64, "a data chunk payload is one 64-byte block");
+            let (d_ptr, d_len) = unsafe { data.read_buffer() };
+            assert_eq!(d_len, 64, "a data chunk payload is one 64-byte block");
             let mut snap = [0u8; 64];
-            snap.copy_from_slice(unsafe { core::slice::from_raw_parts(dptr, 64) });
-            let (rptr, rlen) = unsafe { result.write_buffer() };
+            snap.copy_from_slice(unsafe { core::slice::from_raw_parts(d_ptr, 64) });
+            let (r_ptr, r_len) = unsafe { result.write_buffer() };
             self.chunks.push(Chunk {
                 header,
                 data: snap,
                 joined: false,
-                result_ptr: rptr,
-                result_len: rlen,
+                result_ptr: r_ptr,
+                result_len: r_len,
             });
             Ok(())
         }
@@ -1634,20 +1780,20 @@ mod driver_tests {
             data: impl ReadBuffer<Word = u8>,
             mut result: impl WriteBuffer<Word = u8>,
         ) -> Result<(), Self::Error> {
-            let (dptr, dlen) = unsafe { data.read_buffer() };
-            assert!(dlen >= 68);
-            let hdr: [u8; 4] = unsafe { core::slice::from_raw_parts(dptr, 4) }
+            let (d_ptr, d_len) = unsafe { data.read_buffer() };
+            assert!(d_len >= 68);
+            let hdr: [u8; 4] = unsafe { core::slice::from_raw_parts(d_ptr, 4) }
                 .try_into()
                 .unwrap();
             let mut snap = [0u8; 64];
-            snap.copy_from_slice(unsafe { core::slice::from_raw_parts(dptr.add(4), 64) });
-            let (rptr, rlen) = unsafe { result.write_buffer() };
+            snap.copy_from_slice(unsafe { core::slice::from_raw_parts(d_ptr.add(4), 64) });
+            let (r_ptr, r_len) = unsafe { result.write_buffer() };
             self.chunks.push(Chunk {
                 header: u32::from_be_bytes(hdr),
                 data: snap,
                 joined: true,
-                result_ptr: rptr,
-                result_len: rlen,
+                result_ptr: r_ptr,
+                result_len: r_len,
             });
             Ok(())
         }
@@ -1657,15 +1803,18 @@ mod driver_tests {
             tx: impl ReadBuffer<Word = u8>,
             mut rx: impl WriteBuffer<Word = u8>,
         ) -> Result<(), Self::Error> {
-            let (dptr, dlen) = unsafe { tx.read_buffer() };
-            let (rptr, rlen) = unsafe { rx.write_buffer() };
-            assert_eq!(dlen, rlen, "control tx/rx buffers must match length");
-            assert!(dlen >= 12 && dlen % 4 == 0, "at least header + 1 word + pad");
-            let tx = unsafe { core::slice::from_raw_parts(dptr, dlen) }.to_vec();
+            let (d_ptr, d_len) = unsafe { tx.read_buffer() };
+            let (r_ptr, r_len) = unsafe { rx.write_buffer() };
+            assert_eq!(d_len, r_len, "control tx/rx buffers must match length");
+            assert!(
+                d_len >= 12 && d_len % 4 == 0,
+                "at least header + 1 word + pad"
+            );
+            let tx = unsafe { core::slice::from_raw_parts(d_ptr, d_len) }.to_vec();
             self.control_txns.push(ControlTxn {
                 tx,
-                result_ptr: rptr,
-                result_len: rlen,
+                result_ptr: r_ptr,
+                result_len: r_len,
             });
             Ok(())
         }
@@ -1809,14 +1958,14 @@ mod driver_tests {
                 // CONFIG0: SYNC is sticky once set (spec 7.6)
                 (0, 0x0004) => {
                     let cur = self.reg(0, 0x0004);
-                    let mut newv = val;
+                    let mut new_value = val;
                     if registers::Config0::from_raw(cur).sync() {
-                        newv |= 1 << 15;
+                        new_value |= 1 << 15;
                     }
                     if self.ignore_sync_write {
-                        newv &= !(1 << 15);
+                        new_value &= !(1 << 15);
                     }
-                    self.regs.insert((0, 0x0004), newv);
+                    self.regs.insert((0, 0x0004), new_value);
                 }
                 _ => {
                     self.regs.insert((mms, addr), val);
@@ -1852,27 +2001,27 @@ mod driver_tests {
             tx: impl ReadBuffer<Word = u8>,
             mut rx: impl WriteBuffer<Word = u8>,
         ) -> Result<(), Self::Error> {
-            let (dptr, dlen) = unsafe { tx.read_buffer() };
-            let (rptr, rlen) = unsafe { rx.write_buffer() };
-            assert_eq!(dlen, rlen);
-            let txbuf = unsafe { core::slice::from_raw_parts(dptr, dlen) };
-            let rxbuf = unsafe { core::slice::from_raw_parts_mut(rptr, rlen) };
+            let (d_ptr, d_len) = unsafe { tx.read_buffer() };
+            let (r_ptr, r_len) = unsafe { rx.write_buffer() };
+            assert_eq!(d_len, r_len);
+            let tx_buf = unsafe { core::slice::from_raw_parts(d_ptr, d_len) };
+            let rx_buf = unsafe { core::slice::from_raw_parts_mut(r_ptr, r_len) };
 
-            let hdr = tc6_header::ControlHeader::from_bytes(txbuf[0..4].try_into().unwrap());
+            let hdr = tc6_header::ControlHeader::from_bytes(tx_buf[0..4].try_into().unwrap());
             let n = hdr.len() as usize + 1;
 
-            rxbuf.fill(0);
-            rxbuf[4..8].copy_from_slice(&txbuf[0..4]); // echo the command header
+            rx_buf.fill(0);
+            rx_buf[4..8].copy_from_slice(&tx_buf[0..4]); // echo the command header
             for i in 0..n {
                 let addr = hdr.addr() + i as u16;
                 let out = if hdr.wnr() {
-                    let val = u32::from_be_bytes(txbuf[4 + 4 * i..8 + 4 * i].try_into().unwrap());
+                    let val = u32::from_be_bytes(tx_buf[4 + 4 * i..8 + 4 * i].try_into().unwrap());
                     self.apply_write(hdr.mms(), addr, val);
                     val // echo write data (spec 7.4.4)
                 } else {
                     self.reg(hdr.mms(), addr)
                 };
-                rxbuf[8 + 4 * i..12 + 4 * i].copy_from_slice(&out.to_be_bytes());
+                rx_buf[8 + 4 * i..12 + 4 * i].copy_from_slice(&out.to_be_bytes());
             }
 
             if !self.never_complete {
@@ -1890,7 +2039,7 @@ mod driver_tests {
     /// singletons (they are function-local types) and leaks its queues, so tests running in
     /// parallel never share pool state.
     macro_rules! setup {
-        ($hi:ident, $lo:ident, $iface:expr, $signal:expr) => {
+        ($hi:ident, $lo:ident, $i_face:expr, $signal:expr) => {
             heapless::box_pool!(RxPool: FrameBuffer<M>);
             heapless::box_pool!(TxPool: FrameBuffer<M>);
             for _ in 0..8usize {
@@ -1902,13 +2051,13 @@ mod driver_tests {
             let tx_q: &'static mut Queue<Box<TxPool>, NQ> =
                 ::std::boxed::Box::leak(::std::boxed::Box::new(Queue::new()));
             #[allow(unused_mut)]
-            let (mut $hi, mut $lo) = split(($iface), rx_q, tx_q, ($signal));
+            let (mut $hi, mut $lo) = split(($i_face), rx_q, tx_q, ($signal));
         };
     }
 
     /// Like [`setup!`] but goes through [`split_configured`], unwrapping the bring-up result.
     macro_rules! setup_configured {
-        ($hi:ident, $lo:ident, $iface:expr, $signal:expr, $cfg:expr) => {
+        ($hi:ident, $lo:ident, $i_face:expr, $signal:expr, $cfg:expr) => {
             heapless::box_pool!(RxPool: FrameBuffer<M>);
             heapless::box_pool!(TxPool: FrameBuffer<M>);
             for _ in 0..8usize {
@@ -1920,7 +2069,7 @@ mod driver_tests {
             let tx_q: &'static mut Queue<Box<TxPool>, NQ> =
                 ::std::boxed::Box::leak(::std::boxed::Box::new(Queue::new()));
             #[allow(unused_mut)]
-            let (mut $hi, mut $lo) = split_configured(($iface), rx_q, tx_q, ($signal), $cfg)
+            let (mut $hi, mut $lo) = split_configured(($i_face), rx_q, tx_q, ($signal), $cfg)
                 .expect("bring-up should succeed");
         };
     }
@@ -2166,6 +2315,184 @@ mod driver_tests {
         assert!(hi.current_receive_buffer.is_some());
     }
 
+    /// A data-chunk footer that fails its parity check (a bit error on MISO, or the
+    /// `0xC0000001` header-error code the MAC-PHY streams per spec 7.5.1) is not trusted: the
+    /// transmit chunk is treated as not accepted, so the cursor does not advance and the same
+    /// first block is re-issued on the next `handle_idle`.
+    #[test]
+    fn corrupt_footer_reissues_the_transmit_chunk() {
+        setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true;
+
+        let payload = ethernet_like(64);
+        {
+            let tok = lo.transmit(Instant::ZERO).expect("tx token");
+            tok.consume(64, |b| b.copy_from_slice(&payload));
+        }
+        hi.on_transmit_ready().unwrap();
+        assert_eq!(hi.interface.chunks.len(), 1);
+
+        // footer with a broken parity bit (all-zero footer already fails odd parity)
+        hi.interface.footer_sync = false;
+        hi.interface
+            .respond(&[], crate::tc6_footer::ReceiveFooter::new());
+        hi.handle_transmit_complete().unwrap();
+
+        assert!(matches!(hi.driver_state, TC6DriverState::Idle));
+        assert!(
+            hi.current_transmit_buffer.is_some(),
+            "chunk not accepted - frame retained"
+        );
+        assert_eq!(hi.current_transmit_buffer_cursor, 0, "cursor not advanced");
+
+        // next handle_idle re-issues the identical first block
+        hi.handle_idle().unwrap();
+        assert_eq!(hi.interface.chunks.len(), 2);
+        let reissued = tc6_header::TransmitHeader::from_raw(hi.interface.last().header);
+        assert!(reissued.dnc() && reissued.dv() && reissued.sv());
+        assert_eq!(&hi.interface.last().data[..], &payload[..]);
+
+        // a good footer this time -> frame is done
+        hi.interface.footer_sync = true;
+        hi.interface
+            .respond(&[], crate::tc6_footer::ReceiveFooter::new());
+        hi.handle_transmit_complete().unwrap();
+        assert!(hi.current_transmit_buffer.is_none());
+    }
+
+    /// On a corrupt footer for a *continuation* block, the 4 real frame bytes that were borrowed
+    /// to carry the joined chunk header are restored and the cursor is left where it was, so the
+    /// same continuation block can be re-sent intact.
+    #[test]
+    fn corrupt_footer_on_continuation_block_restores_borrowed_bytes() {
+        setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true;
+
+        let payload = ethernet_like(128); // two blocks
+        {
+            let tok = lo.transmit(Instant::ZERO).expect("tx token");
+            tok.consume(payload.len(), |b| b.copy_from_slice(&payload));
+        }
+
+        // block 0 accepted
+        hi.on_transmit_ready().unwrap();
+        hi.interface.respond(
+            &[],
+            crate::tc6_footer::ReceiveFooter::new().with_correct_parity(),
+        );
+        hi.handle_transmit_complete().unwrap();
+        assert_eq!(hi.current_transmit_buffer_cursor, 64);
+
+        // block 1 (joined continuation) - borrows payload[60..64] for its header
+        hi.handle_idle().unwrap();
+        assert_eq!(&hi.scratch_header[..], &payload[60..64]);
+
+        // corrupt footer for block 1
+        hi.interface.footer_sync = false;
+        hi.interface
+            .respond(&[], crate::tc6_footer::ReceiveFooter::new());
+        hi.handle_transmit_complete().unwrap();
+
+        assert_eq!(hi.current_transmit_buffer_cursor, 64, "cursor held");
+        assert!(hi.current_transmit_buffer.is_some());
+        assert_eq!(
+            &hi.current_transmit_buffer.as_ref().unwrap().as_slice()[60..64],
+            &payload[60..64],
+            "borrowed frame bytes restored"
+        );
+    }
+
+    /// A data-chunk footer with EXST = 1 latches `extended_status_pending`; the DV payload in the
+    /// same footer is still processed.
+    #[test]
+    fn exst_footer_latches_pending_and_still_delivers_the_frame() {
+        setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true;
+
+        hi.handle_idle().unwrap();
+        assert!(!hi.extended_status_pending());
+
+        let frame = ethernet_like(40);
+        hi.interface.respond(
+            &frame,
+            crate::tc6_footer::ReceiveFooter::new()
+                .with_exst(true)
+                .with_dv(true)
+                .with_sv(true)
+                .with_swo(0)
+                .with_ev(true)
+                .with_ebo(frame.len() as u8 - 1)
+                .with_correct_parity(),
+        );
+        hi.handle_transmit_complete().unwrap();
+
+        assert!(hi.extended_status_pending(), "EXST latched");
+        let (rx, _tx) = lo.receive(Instant::ZERO).expect("frame still delivered");
+        rx.consume(|b| assert_eq!(b, frame.as_slice()));
+    }
+
+    /// A footer whose byte offsets are inconsistent (here EV with the end offset before the
+    /// start offset) is rejected: the in-progress receive frame is dropped instead of driving an
+    /// out-of-range `add_len` that would panic. The driver keeps running.
+    #[test]
+    fn corrupt_footer_offsets_drop_the_frame_without_panic() {
+        setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true;
+
+        hi.handle_idle().unwrap();
+        hi.interface.footer_sync = false;
+        hi.interface.respond(
+            &ethernet_like(64),
+            crate::tc6_footer::ReceiveFooter::new()
+                .with_sync(true)
+                .with_dv(true)
+                .with_sv(true)
+                .with_swo(10) // start byte 40
+                .with_ev(true)
+                .with_ebo(3) // end byte 3 - before the start
+                .with_correct_parity(),
+        );
+        hi.handle_transmit_complete().unwrap();
+
+        assert!(hi.current_receive_buffer.is_none(), "bad frame dropped");
+        assert!(lo.receive(Instant::ZERO).is_none());
+        assert!(matches!(hi.driver_state, TC6DriverState::Idle));
+
+        // still alive
+        hi.handle_idle().unwrap();
+        assert!(hi.current_receive_buffer.is_some());
+    }
+
+    /// With the receive pool fully drained, `handle_idle` neither panics nor churns the bus when
+    /// there is nothing to transmit; when a frame *is* queued it still goes out with NORX set.
+    #[test]
+    fn rx_pool_exhaustion_defers_instead_of_panicking() {
+        setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true;
+
+        let mut hog: Vec<Box<RxPool>> = Vec::new();
+        while let Ok(b) = RxPool.alloc(FrameBuffer::new()) {
+            hog.push(b);
+        }
+
+        // nothing queued + no rx buffer: defer, stay Idle, issue no chunk
+        hi.handle_idle().unwrap();
+        assert!(matches!(hi.driver_state, TC6DriverState::Idle));
+        assert!(hi.current_receive_buffer.is_none());
+        assert!(hi.interface.chunks.is_empty());
+
+        // a queued transmit still goes out, with NORX because inbound data can't be accepted
+        {
+            let tok = lo.transmit(Instant::ZERO).expect("tx token");
+            tok.consume(64, |b| b.copy_from_slice(&ethernet_like(64)));
+        }
+        hi.on_transmit_ready().unwrap();
+        assert_eq!(hi.interface.chunks.len(), 1);
+        assert!(tc6_header::TransmitHeader::from_raw(hi.interface.last().header).norx());
+
+        drop(hog);
+    }
+
     #[test]
     fn receive_only_chunk_targets_the_receive_buffer_tail() {
         setup!(hi, _lo, SpyInterface::default(), NoopSignal);
@@ -2198,12 +2525,12 @@ mod driver_tests {
                 data: impl ReadBuffer<Word = u8>,
                 mut result: impl WriteBuffer<Word = u8>,
             ) -> Result<(), Self::Error> {
-                let (dptr, dlen) = unsafe { data.read_buffer() };
-                assert_eq!(dlen, 64);
+                let (d_ptr, d_len) = unsafe { data.read_buffer() };
+                assert_eq!(d_len, 64);
                 let mut snap = [0u8; 64];
-                snap.copy_from_slice(unsafe { core::slice::from_raw_parts(dptr, 64) });
-                let (_rptr, rlen) = unsafe { result.write_buffer() };
-                self.last = Some((header, snap, rlen));
+                snap.copy_from_slice(unsafe { core::slice::from_raw_parts(d_ptr, 64) });
+                let (_r_ptr, r_len) = unsafe { result.write_buffer() };
+                self.last = Some((header, snap, r_len));
                 Ok(())
             }
             fn transfer_complete(&mut self) -> Result<bool, Self::Error> {
@@ -2230,14 +2557,14 @@ mod driver_tests {
         }
         let mut result = [0u8; 68];
 
-        let mut iface = Recording::default();
-        iface
+        let mut i_face = Recording::default();
+        i_face
             .begin_send_joined_block(RawBuf::new(&mut data[..]), RawBuf::new(&mut result[..]))
             .unwrap();
 
-        let (h, payload, rlen) = iface.last.expect("forwarded to begin_send_block");
+        let (h, payload, r_len) = i_face.last.expect("forwarded to begin_send_block");
         assert_eq!(h, header.raw());
-        assert_eq!(rlen, 68);
+        assert_eq!(r_len, 68);
         assert_eq!(payload, core::array::from_fn::<u8, 64, _>(|i| i as u8));
     }
 
@@ -2251,8 +2578,8 @@ mod driver_tests {
         use crate::embedded_io_implementation::EmbeddedHalImplementation;
         use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
 
-        let iface = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
-        setup!(hi, lo, iface, NoopSignal);
+        let i_face = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
+        setup!(hi, lo, i_face, NoopSignal);
         hi.sync_established = true; // data-path test: pretend configure() ran
 
         let payload = ethernet_like(64);
@@ -2491,7 +2818,11 @@ mod driver_tests {
             crate::tc6_footer::ReceiveFooter::new().with_correct_parity(),
         );
         hi.on_interrupt().unwrap();
-        assert_eq!(hi.interface.chunks.len(), 2, "no further polls once RCA = 0");
+        assert_eq!(
+            hi.interface.chunks.len(),
+            2,
+            "no further polls once RCA = 0"
+        );
         assert!(matches!(hi.driver_state, TC6DriverState::Idle));
     }
 
@@ -2622,8 +2953,8 @@ mod driver_tests {
         use crate::embedded_io_implementation::EmbeddedHalImplementation;
         use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
 
-        let iface = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
-        setup!(hi, lo, iface, NoopSignal);
+        let interface = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
+        setup!(hi, lo, interface, NoopSignal);
         hi.configure(&Config::default()).expect("bring-up");
 
         let payload = ethernet_like(192); // three blocks
@@ -2664,7 +2995,12 @@ mod driver_tests {
 
         let rx_frame: Vec<u8> = (0..128u32).map(|i| (i as u8) ^ 0x5A).collect();
 
-        setup!(hi, lo, PollingFake::new(FakeTc6SpiDevice::new()), NoopSignal);
+        setup!(
+            hi,
+            lo,
+            PollingFake::new(FakeTc6SpiDevice::new()),
+            NoopSignal
+        );
         hi.configure(&Config::default()).expect("bring-up");
         // seed the MAC-PHY with a frame to receive (after bring-up so the control traffic
         // doesn't run over it)
@@ -2748,7 +3084,8 @@ mod driver_tests {
     fn register_write_puts_data_after_header_and_echoes_it() {
         setup!(hi, _lo, SpyInterface::default(), NoopSignal);
 
-        hi.begin_register_write(0, 0x0004, &[0xDEAD_BEEF]).expect("accepted");
+        hi.begin_register_write(0, 0x0004, &[0xDEAD_BEEF])
+            .expect("accepted");
 
         let txn = hi.interface.last_control();
         let sent = tc6_header::ControlHeader::from_bytes(txn.tx[0..4].try_into().unwrap());
@@ -2757,7 +3094,11 @@ mod driver_tests {
         assert_eq!(sent.addr(), 0x0004);
         assert_eq!(sent.len(), 0);
         assert!(sent.parity_ok());
-        assert_eq!(&txn.tx[4..8], &0xDEAD_BEEFu32.to_be_bytes(), "data word follows header");
+        assert_eq!(
+            &txn.tx[4..8],
+            &0xDEAD_BEEFu32.to_be_bytes(),
+            "data word follows header"
+        );
 
         hi.interface.respond_control_write();
         hi.handle_control_complete().unwrap();
@@ -2782,7 +3123,8 @@ mod driver_tests {
         assert_eq!(sent.len(), 2, "3 registers -> LEN = 2");
         assert_eq!(hi.interface.last_control().tx.len(), 4 * (3 + 2));
 
-        hi.interface.respond_control_read(&[0x0000_0011, 0x0000_0011, 0xAABB_CCDD]);
+        hi.interface
+            .respond_control_read(&[0x0000_0011, 0x0000_0011, 0xAABB_CCDD]);
         hi.handle_control_complete().unwrap();
 
         let res = hi.take_control_result().unwrap();
@@ -2811,7 +3153,8 @@ mod driver_tests {
     fn second_control_request_while_busy_is_rejected() {
         setup!(hi, _lo, SpyInterface::default(), NoopSignal);
 
-        hi.begin_register_read(0, 0x0002, 1).expect("first accepted");
+        hi.begin_register_read(0, 0x0002, 1)
+            .expect("first accepted");
         assert!(matches!(
             hi.begin_register_read(0, 0x0003, 1),
             Err(ControlError::Busy)
@@ -2969,7 +3312,12 @@ mod driver_tests {
         setup!(hi, _lo, RegDouble::new(), NoopSignal);
         hi.configure(&Config::default()).expect("bring-up ok");
 
-        let first = hi.interface.writes.first().copied().expect("a write happened");
+        let first = hi
+            .interface
+            .writes
+            .first()
+            .copied()
+            .expect("a write happened");
         assert_eq!(
             first,
             (0, registers::addr::RESET, registers::Reset::SWRESET.raw()),
@@ -3107,8 +3455,8 @@ mod driver_tests {
         use crate::embedded_io_implementation::EmbeddedHalImplementation;
         use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
 
-        let iface = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
-        setup!(hi, _lo, iface, NoopSignal);
+        let interface = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
+        setup!(hi, _lo, interface, NoopSignal);
 
         hi.configure(&Config::default())
             .expect("bring-up through the real wire format");
@@ -3133,8 +3481,8 @@ mod driver_tests {
         use crate::embedded_io_implementation::EmbeddedHalImplementation;
         use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
 
-        let iface = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
-        setup!(hi, _lo, iface, NoopSignal);
+        let interface = EmbeddedHalImplementation::new(FakeTc6SpiDevice::new());
+        setup!(hi, _lo, interface, NoopSignal);
 
         let cfg = Config {
             plca: Some(PlcaConfig::follower(3)),
@@ -3174,6 +3522,47 @@ mod driver_tests {
             hi.interface.inner_mut().device.read_reg(0, 0x0008) & (1 << 5),
             0
         );
+    }
+
+    /// End to end: `service_extended_status` reads `STATUS0` from `fake_tc6`, reports the set
+    /// error bit, write-1-to-clears it, and clears the pending latch.
+    #[test]
+    #[cfg(feature = "embedded-hal")]
+    fn service_extended_status_reads_and_clears_status0_through_fake_tc6() {
+        use crate::embedded_io_implementation::EmbeddedHalImplementation;
+        use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
+
+        let mut spi = FakeTc6SpiDevice::new();
+        // one bad control header makes the fake latch STATUS0.HDRE (bit 5); the flag is one-shot
+        spi.device.force_bad_control_header = true;
+        setup!(hi, _lo, EmbeddedHalImplementation::new(spi), NoopSignal);
+
+        hi.begin_register_read(0, 0x0000, 1).expect("queued");
+        hi.handle_control_complete().unwrap();
+        let _ = hi.take_control_result();
+        assert_ne!(
+            hi.interface.inner_mut().device.read_reg(0, 0x0008) & (1 << 5),
+            0,
+            "fake latched STATUS0.HDRE"
+        );
+
+        // a data footer reported EXST=1 at some point
+        hi.extended_status_pending = true;
+
+        let s0 = hi
+            .service_extended_status(10_000)
+            .expect("no interface error")
+            .expect("something was pending");
+        assert!(s0.hdre(), "service read STATUS0 and saw HDRE");
+        assert!(!hi.extended_status_pending(), "pending latch cleared");
+        assert_eq!(
+            hi.interface.inner_mut().device.read_reg(0, 0x0008) & (1 << 5),
+            0,
+            "HDRE write-1-cleared by the service"
+        );
+
+        // nothing pending now
+        assert!(hi.service_extended_status(10_000).unwrap().is_none());
     }
 
     /// A receive footer with SYNC = 0 after bring-up means the chip reset itself; the driver

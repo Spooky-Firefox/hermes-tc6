@@ -45,6 +45,14 @@ impl<const M: usize> FrameBuffer<M> {
         self.len += len;
     }
 
+    /// Bytes of spare capacity after the initialized region (`M - start - len`). This is the
+    /// largest `len` a following [`add_len`](Self::add_len) / [`get_mut_at_end`](Self::get_mut_at_end)
+    /// call can take without tripping their bounds assertions - callers handling untrusted
+    /// on-wire framing should check against this instead of relying on the assert to fire.
+    pub fn spare_capacity(&self) -> usize {
+        M - self.start - self.len
+    }
+
     pub unsafe fn set_start(&mut self, start: usize) {
         assert!(start <= M);
         self.start = start;

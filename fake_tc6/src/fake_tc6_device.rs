@@ -1,7 +1,7 @@
 use crate::{
     control_header::ControlHeader,
     fake_tc6_device::Mode::{Command, ReadingCommandHeader, ReadingHeader, ReadingWritingBlock},
-    receive_footer::{self, ReceiveFooter},
+    receive_footer::ReceiveFooter,
     transmit_header::TransmitHeader,
 };
 
@@ -159,7 +159,7 @@ impl FakeTc6Device {
     }
 
     /// Write a control register, honouring read-only / write-1-to-clear / sticky semantics.
-    /// Writes to unmodelled maps/addresses are ignored (spec Section 7.4.2/7.4.3).
+    /// Writes to unmodeled maps/addresses are ignored (spec Section 7.4.2/7.4.3).
     fn write_reg(&mut self, mms: u8, addr: u16, val: u32) {
         match mms {
             0 => match addr {
@@ -183,8 +183,7 @@ impl FakeTc6Device {
                 // PLCA IDVER (0xCA00) and STATUS (0xCA03) are read-only
                 if addr != 0xCA00
                     && addr != 0xCA03
-                    && let Some(slot) =
-                        self.regs_mms4.get_mut(addr.wrapping_sub(0xCA00) as usize)
+                    && let Some(slot) = self.regs_mms4.get_mut(addr.wrapping_sub(0xCA00) as usize)
                 {
                     *slot = val;
                 }
@@ -369,7 +368,7 @@ impl FakeTc6Device {
         self.command_mosi.push(byte);
 
         // Odd parity over the whole 32-bit header (spec 8.5.2): a valid header has an odd
-        // popcount. `force_bad_control_header` lets a test inject the error path unconditionally.
+        // pop count. `force_bad_control_header` lets a test inject the error path unconditionally.
         let header_raw = u32::from_be_bytes(self.mosi_header_raw);
         let header_bad = self.force_bad_control_header || header_raw.count_ones() % 2 == 0;
 
@@ -425,7 +424,7 @@ impl FakeTc6Device {
         _byte: u8,
         _i: usize,
     ) -> Result<u8, FakeTc6DeviceError> {
-        // Control headers are recognised and parsed in `handle_reading_header` (DNC = 0 ->
+        // Control headers are recognized and parsed in `handle_reading_header` (DNC = 0 ->
         // `Command`), so this mode is never entered.
         unreachable!("ReadingCommandHeader is unused; see handle_reading_header")
     }
