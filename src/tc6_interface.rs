@@ -1,6 +1,26 @@
 use embedded_dma::{ReadBuffer, WriteBuffer};
 
-/// SAFETY: The implementor must ensure that when dropped, any ongoing DMA transfers are completed or aborted before the implementor is dropped. This is to ensure that the DMA transfer does not access invalid memory after the implementor is dropped.
+/// The SPI transport the driver talks to the MAC-PHY through.
+///
+/// # SPI bus requirements
+///
+/// The OPEN Alliance TC6 interface is **SPI mode 0** (CPOL = 0, CPHA = 0), **MSB first**, with
+/// SCK up to the MAC-PHY's rated maximum (commonly 15-25 MHz; check the datasheet). This trait
+/// does not configure the bus - the application must set it up before constructing the
+/// implementor. A wrong mode or bit order typically shows up as `configure()` returning
+/// [`ConfigError::BusUnresponsive`](crate::tc6_driver::ConfigError::BusUnresponsive) (IDVER reads
+/// all-zero / all-ones) or [`ConfigError::HeaderRejected`](crate::tc6_driver::ConfigError::HeaderRejected)
+/// on the very first control command (headers corrupted by a wrong sampling edge).
+///
+/// CSn is asserted low for a transaction and deasserted high at its end. Per spec 7.2 the host
+/// must hold CSn deasserted for at least the MAC-PHY's `resync_timer` when switching between a
+/// data transaction and a control transaction; ensuring that is currently the implementor's
+/// responsibility (see `todo.md`).
+///
+/// # Safety
+///
+/// The implementor must ensure that when dropped, any ongoing DMA transfers are completed or
+/// aborted first, so a DMA engine cannot write into freed memory.
 pub trait Tc6Interface {
     type Error;
     // Todo add error type

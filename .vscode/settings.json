@@ -49,6 +49,7 @@
         "TXFCSE",
         "txns",
         "TXPE",
+        "UART",
         "unconfigured",
         "Uninit",
         "unwedges"

@@ -57,6 +57,17 @@ pub const CONTROL_MAX_REGS: usize = 8;
 /// 4-byte header + `n` data words + 4-byte trailing don't-care word (TC6 spec Figures 13/14).
 const CONTROL_BUF_LEN: usize = 4 * (CONTROL_MAX_REGS + 2);
 
+/// Ethernet L2 MTU reported to smoltcp: 14-byte header + 1500-byte payload, no FCS (the MAC-PHY
+/// appends/strips it, spec 7.3).
+const ETHERNET_MTU: usize = 1514;
+
+/// Minimum `FrameBuffer` capacity `M` the driver is safe with. A receive frame accumulates up to
+/// a full 1518-byte Ethernet frame (1514 + FCS, in case the MAC is configured to pass it), and
+/// on every chunk the driver hands the MAC a 64-byte payload + 4-byte footer landing zone
+/// *past* the data written so far (`FrameBuffer::get_mut_at_end(68)`). So `M` must cover
+/// `1518 + 64 + 4`, rounded up for headroom.
+const MIN_FRAME_BUFFER_CAPACITY: usize = 1600;
+
 /// Error from the register read/write entry points on [`TC6HighPrio`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlError<E> {
@@ -194,9 +205,15 @@ impl PlcaConfig {
 pub struct Config {
     /// `CONFIG0.TXCTHRESH`.
     pub tx_credit_threshold: TxCreditThreshold,
-    /// `CONFIG0.TXCTE` - cut-through from the SPI host to the network. Requires `STDCAP.CTC`.
+    /// `CONFIG0.TXCTE` - cut-through from the SPI host to the network (requires `STDCAP.CTC`).
+    ///
+    /// **Not implemented yet:** the data path has no cut-through handling (transmit-buffer
+    /// underflow recovery, partial-frame termination), so [`configure`](TC6HighPrio::configure)
+    /// rejects `true` with [`ConfigError::NotImplemented`].
     pub cut_through_tx: bool,
-    /// `CONFIG0.RXCTE` - cut-through from the network to the SPI host. Requires `STDCAP.CTC`.
+    /// `CONFIG0.RXCTE` - cut-through from the network to the SPI host (requires `STDCAP.CTC`).
+    ///
+    /// **Not implemented yet** - see [`cut_through_tx`](Self::cut_through_tx).
     pub cut_through_rx: bool,
     /// `Some` would enable `CONFIG0.FTSE` and pick the width via `FTSS` (requires `STDCAP.FTSC`).
     ///
@@ -251,7 +268,12 @@ pub enum ConfigError<E> {
     Timeout,
     /// `STATUS0.RESETC` never became set within `Config::reset_poll_limit` reads.
     ResetNotComplete,
-    /// `IDVER` read back implausible - the bus is not working or this is not a TC6 device.
+    /// `IDVER` read back as all-zero or all-ones: MISO is stuck, there is no clock, or the SPI
+    /// bus is misconfigured (wrong mode / bit order). Check the transport before the device -
+    /// SPI **mode 0** (CPOL = 0, CPHA = 0), MSB first, SCK within the MAC-PHY's rated maximum.
+    BusUnresponsive,
+    /// `IDVER` read back a plausible value but `MAJVER` is 0 - the bus is talking but this is
+    /// not a TC6 v1.x device (or, less likely, a subtle SPI sampling error).
     BadVersion { major: u8, minor: u8 },
     /// A requested feature is not advertised in `STDCAP` (the `&str` names it).
     Unsupported(&'static str),
@@ -261,7 +283,9 @@ pub enum ConfigError<E> {
     NotImplemented(&'static str),
     /// `CONFIG0` read-back did not show `SYNC` set with a 64-byte chunk payload.
     SyncFailed,
-    /// The MAC-PHY rejected a control command header (parity error / HDRB).
+    /// The MAC-PHY rejected a control command header (parity error / HDRB). If this happens on
+    /// the *first* command of `configure`, suspect the SPI mode / bit order rather than the
+    /// header: a wrong sampling edge corrupts every header consistently.
     HeaderRejected,
     /// The underlying interface failed to run a transfer.
     Interface(E),
@@ -356,6 +380,16 @@ where
     TxP: BoxPool<Data = FrameBuffer<M>> + 'static,
     S: TransmitSignal,
 {
+    // Post-monomorphization checks: too-small buffers / queues would only surface as a runtime
+    // panic (or worse) deep in the data path.
+    const {
+        assert!(
+            M >= MIN_FRAME_BUFFER_CAPACITY,
+            "FrameBuffer capacity M is too small - see MIN_FRAME_BUFFER_CAPACITY"
+        );
+        assert!(NQ >= 2, "the frame queues need NQ >= 2 (usable capacity is NQ - 1)");
+    }
+
     debug!(
         "tc6: split() - M={}, NQ={}, driver starts unconfigured",
         M, NQ
@@ -1172,7 +1206,7 @@ where
     ///
     /// 0. if `cfg.software_reset`, assert `RESET.SWRESET`,
     /// 1. wait for `STATUS0.RESETC` (reset complete),
-    /// 2. sanity-check `IDVER`,
+    /// 2. sanity-check `IDVER` (all-zero / all-ones => [`ConfigError::BusUnresponsive`]), log `PHYID`,
     /// 3. gate requested features on `STDCAP`,
     /// 4. write `CONFIG0` with a 64-byte chunk payload and `SYNC = 1`,
     /// 5. read `CONFIG0` back and confirm `SYNC` stuck,
@@ -1186,7 +1220,7 @@ where
     /// source wired up yet. On [`ConfigError::Timeout`] the state machine is returned to idle,
     /// but a genuinely stuck transfer may still be running on the interface.
     pub fn configure(&mut self, cfg: &Config) -> Result<(), ConfigError<T::Error>> {
-        use registers::{Config0, IdVer, Reset, Status0, StdCap, addr, mms};
+        use registers::{Config0, IdVer, PhyId, Reset, Status0, StdCap, addr, mms};
 
         info!("tc6: configure() starting bring-up");
 
@@ -1231,15 +1265,21 @@ where
         }
         debug!("tc6: reset complete after {} STATUS0 read(s)", tries + 1);
 
-        // 2. is anyone home?
-        let id = IdVer::from_raw(self.read_reg_blocking(
-            mms::STANDARD,
-            addr::IDVER,
-            cfg.transfer_poll_limit,
-        )?);
+        // 2. is anyone home? An all-zero / all-ones IDVER means the SPI bus itself is not
+        //    working (no clock, MISO stuck, wrong mode / bit order) rather than "wrong chip".
+        let id_raw =
+            self.read_reg_blocking(mms::STANDARD, addr::IDVER, cfg.transfer_poll_limit)?;
+        if id_raw == 0x0000_0000 || id_raw == 0xFFFF_FFFF {
+            error!(
+                "tc6: IDVER read back {:#010x} - SPI bus unresponsive (check clock / mode 0 / MSB-first / wiring)",
+                id_raw
+            );
+            return Err(ConfigError::BusUnresponsive);
+        }
+        let id = IdVer::from_raw(id_raw);
         if id.majver() == 0 {
             error!(
-                "tc6: implausible IDVER (major={}, minor={}) - bus dead or not a TC6 device",
+                "tc6: implausible IDVER (major={}, minor={}) - not a TC6 device or SPI sampling error",
                 id.majver(),
                 id.minver()
             );
@@ -1248,7 +1288,22 @@ where
                 minor: id.minver(),
             });
         }
-        debug!("tc6: IDVER major={} minor={}", id.majver(), id.minver());
+        // PHYID corroborates: a real integrated PHY reports a non-zero OUI-derived value. Log it
+        // for bring-up (a 0 / all-ones here alongside a good IDVER hints at a marginal bus)
+        // without failing on it - some parts legitimately gate PHYID behind PHY power-up.
+        let phy_id = PhyId::from_raw(self.read_reg_blocking(
+            mms::STANDARD,
+            addr::PHYID,
+            cfg.transfer_poll_limit,
+        )?);
+        debug!(
+            "tc6: IDVER major={} minor={}, PHYID oui={:#08x} model={:#04x} rev={}",
+            id.majver(),
+            id.minver(),
+            phy_id.oui(),
+            phy_id.model(),
+            phy_id.revision()
+        );
 
         // 3. capability gating
         let cap = StdCap::from_raw(self.read_reg_blocking(
@@ -1256,9 +1311,16 @@ where
             addr::STDCAP,
             cfg.transfer_poll_limit,
         )?);
-        if (cfg.cut_through_tx || cfg.cut_through_rx) && !cap.ctc() {
-            warn!("tc6: cut-through requested but STDCAP.CTC is not set");
-            return Err(ConfigError::Unsupported("cut-through"));
+        if cfg.cut_through_tx || cfg.cut_through_rx {
+            if !cap.ctc() {
+                warn!("tc6: cut-through requested but STDCAP.CTC is not set");
+                return Err(ConfigError::Unsupported("cut-through"));
+            }
+            // The data path has no cut-through handling (no TXBUE recovery, no partial-frame
+            // termination), so enabling CONFIG0.TXCTE/RXCTE would misbehave under load. Refuse
+            // rather than half-wire it - same policy as `timestamp`.
+            warn!("tc6: cut-through requested but the data path has no cut-through handling yet");
+            return Err(ConfigError::NotImplemented("cut-through"));
         }
         if cfg.timestamp.is_some() {
             if !cap.ftsc() {
@@ -1273,12 +1335,10 @@ where
         }
 
         // 4. write CONFIG0 with the driver's required 64-byte chunk payload and SYNC = 1.
-        //    FTSE/FTSS are intentionally left clear - `cfg.timestamp` is rejected above until the
-        //    receive path can strip the prepended timestamp.
+        //    TXCTE/RXCTE and FTSE/FTSS are intentionally left clear - `cfg.cut_through_*` and
+        //    `cfg.timestamp` are rejected above until the data path supports them.
         let c0 = Config0::from_raw(0)
             .with_cps(6) // 2^6 = 64-byte data chunk payload
-            .with_txcte(cfg.cut_through_tx)
-            .with_rxcte(cfg.cut_through_rx)
             .with_txcthresh(cfg.tx_credit_threshold.bits())
             .with_sync(true);
         self.write_reg_blocking(
@@ -1528,10 +1588,15 @@ where
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         let mut cap = DeviceCapabilities::default();
         cap.medium = smoltcp::phy::Medium::Ethernet;
-        cap.max_burst_size = Some(NQ);
-        // set default checksum capabilities, which is calculated and verified by software (TODO find out if this is the case, and that i have not mixed it up)
+        // smoltcp's MTU is the L2 frame size *including* the 14-byte Ethernet header but
+        // excluding the FCS (the MAC-PHY appends/strips the FCS itself, spec 7.3): 14 + 1500.
+        cap.max_transmission_unit = ETHERNET_MTU;
+        // How many frames smoltcp may hand us back-to-back before it must poll again. The
+        // tx-ready SPSC queue holds `NQ - 1` (one slot is the ring's empty/full sentinel).
+        cap.max_burst_size = Some(NQ - 1);
+        // The MAC-PHY only computes/checks the Ethernet FCS; IP/TCP/UDP checksums are all
+        // software's job, which is exactly what `ChecksumCapabilities::default()` says.
         cap.checksum = smoltcp::phy::ChecksumCapabilities::default();
-        cap.max_transmission_unit = M; //TODO actually determine what the correct MTU should be for a ethernet frame
         cap
     }
 
@@ -1603,7 +1668,7 @@ mod driver_tests {
     use std::collections::BTreeMap;
     use std::vec::Vec;
 
-    const M: usize = 1536; // FrameBuffer capacity (bytes)
+    const M: usize = 1600; // FrameBuffer capacity (bytes); >= MIN_FRAME_BUFFER_CAPACITY
     const NQ: usize = 4; // spsc queue const param; usable capacity is NQ - 1 == 3
 
     // --------------------------------------------------------------------------------------
@@ -2089,8 +2154,8 @@ mod driver_tests {
         setup!(_hi, lo, SpyInterface::default(), NoopSignal);
         let caps = lo.capabilities();
         assert_eq!(caps.medium, Medium::Ethernet);
-        assert_eq!(caps.max_transmission_unit, M);
-        assert_eq!(caps.max_burst_size, Some(NQ));
+        assert_eq!(caps.max_transmission_unit, 1514, "Ethernet header + 1500 payload, no FCS");
+        assert_eq!(caps.max_burst_size, Some(NQ - 1), "usable tx-ready queue depth");
     }
 
     #[test]
@@ -3274,17 +3339,32 @@ mod driver_tests {
         setup!(hi, _lo, RegDouble::new(), NoopSignal);
         let cfg = Config {
             tx_credit_threshold: TxCreditThreshold::Eight,
-            cut_through_rx: true,
             ..Config::default()
         };
         hi.configure(&cfg).expect("bring-up ok");
 
         let c0 = registers::Config0::from_raw(hi.interface.reg(0, 0x0004));
-        assert!(c0.rxcte());
-        assert!(!c0.txcte());
         assert_eq!(c0.txcthresh(), 0b10);
+        assert!(!c0.txcte() && !c0.rxcte(), "cut-through stays off");
         assert!(!c0.ftse() && !c0.ftss(), "timestamps stay off");
         assert!(c0.sync());
+    }
+
+    /// Cut-through is rejected even when the chip advertises `STDCAP.CTC`, because the data path
+    /// has no cut-through handling - same policy as `timestamp`.
+    #[test]
+    fn configure_rejects_cut_through_even_when_supported() {
+        setup!(hi, _lo, RegDouble::new(), NoopSignal); // default STDCAP has CTC
+        let cfg = Config {
+            cut_through_tx: true,
+            ..Config::default()
+        };
+        assert!(matches!(
+            hi.configure(&cfg),
+            Err(ConfigError::NotImplemented("cut-through"))
+        ));
+        assert!(!hi.is_configured());
+        assert!(!registers::Config0::from_raw(hi.interface.reg(0, 0x0004)).txcte());
     }
 
     /// `Config::timestamp` is accepted by the type system but the receive path can't strip the
@@ -3378,11 +3458,35 @@ mod driver_tests {
     #[test]
     fn configure_rejects_implausible_version() {
         setup!(hi, _lo, RegDouble::new(), NoopSignal);
-        hi.interface.regs.insert((0, 0x0000), 0);
+        // plausible-looking word (not all-zero / all-ones) but MAJVER = 0
+        hi.interface.regs.insert((0, 0x0000), 0x0000_0005);
 
         assert!(matches!(
             hi.configure(&Config::default()),
-            Err(ConfigError::BadVersion { major: 0, .. })
+            Err(ConfigError::BadVersion { major: 0, minor: 5 })
+        ));
+    }
+
+    /// An all-zero `IDVER` read means the SPI bus itself is not working (no clock, stuck MISO,
+    /// wrong mode) - distinct from "wrong device".
+    #[test]
+    fn configure_flags_unresponsive_bus_all_zero() {
+        setup!(hi, _lo, RegDouble::new(), NoopSignal);
+        hi.interface.regs.insert((0, 0x0000), 0x0000_0000);
+        assert!(matches!(
+            hi.configure(&Config::default()),
+            Err(ConfigError::BusUnresponsive)
+        ));
+    }
+
+    /// Same for an all-ones `IDVER` read (MISO stuck high / floating).
+    #[test]
+    fn configure_flags_unresponsive_bus_all_ones() {
+        setup!(hi, _lo, RegDouble::new(), NoopSignal);
+        hi.interface.regs.insert((0, 0x0000), 0xFFFF_FFFF);
+        assert!(matches!(
+            hi.configure(&Config::default()),
+            Err(ConfigError::BusUnresponsive)
         ));
     }
 

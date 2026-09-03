@@ -2,6 +2,15 @@ use core::slice;
 
 use embedded_hal::spi::SpiDevice;
 
+/// [`Tc6Interface`](crate::tc6_interface::Tc6Interface) on top of a blocking `embedded-hal`
+/// [`SpiDevice`]. [`transfer_complete`](crate::tc6_interface::Tc6Interface::transfer_complete)
+/// always returns `true` (each call runs the transfer synchronously), so drive the driver with
+/// `on_transmit_ready` / manual steps rather than expecting `on_interrupt` to yield mid-burst.
+///
+/// The `SpiDevice` must be configured for **SPI mode 0** (CPOL = 0, CPHA = 0), **MSB first**.
+/// This wrapper does not enforce the spec-7.2 `resync_timer` CSn hold when switching between
+/// data and control transactions; if you interleave `configure` / register reads with data
+/// traffic, wrap a `SpiDevice` that inserts that delay (see `todo.md`).
 pub struct EmbeddedHalImplementation<T: SpiDevice> {
     inner: T,
 }
