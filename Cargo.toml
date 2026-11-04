@@ -33,7 +33,10 @@ embedded-hal = { version = "1.0.0", optional = true }
 # swap for "portable-atomic-unsafe-assume-single-core" if you'd rather not depend on a
 # critical-section impl being registered, but only on genuinely single-core MCUs.
 heapless = { version = "0.9.3", features = ["portable-atomic-critical-section"] }
-smoltcp = "0.13.1"
+# no default features: the defaults pull in `std` (and `log`), which breaks no_std targets.
+# The driver only needs `phy::Device` + `Medium::Ethernet` (which drags in `socket`, and that
+# requires at least one socket kind, hence `socket-udp`); apps enable the rest themselves.
+smoltcp = { version = "0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-udp"] }
 
 defmt = { version = "1", optional = true }
 log = { version = "0.4", optional = true }

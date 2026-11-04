@@ -7,6 +7,7 @@
         "CSMA",
         "deasserted",
         "deasserts",
+        "defmt",
         "Deque",
         "desync",
         "desynced",
@@ -52,6 +53,7 @@
         "UART",
         "unconfigured",
         "Uninit",
-        "unwedges"
+        "unwedges",
+        "usize"
     ]
 }
