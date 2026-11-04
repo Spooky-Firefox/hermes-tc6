@@ -1,2 +1,7 @@
-/target
+# build output at any depth (root crate, fake_tc6, examples/*)
+target/
+# library crate: don't pin deps for downstream users...
 Cargo.lock
+# ...but firmware binaries should build reproducibly
+!examples/*/Cargo.lock
+/tmp

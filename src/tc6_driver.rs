@@ -1126,6 +1126,21 @@ where
         self.sync_established
     }
 
+    /// Shared access to the underlying transport.
+    pub fn interface(&self) -> &T {
+        &self.interface
+    }
+
+    /// Exclusive access to the underlying transport, for diagnostics and hardware tests (e.g.
+    /// changing the SPI clock, or injecting malformed transactions).
+    ///
+    /// Only use it while the driver is idle: no transfer in flight and no control transaction
+    /// pending ([`control_busy`](Self::control_busy) is `false`). Anything sent through it
+    /// bypasses the driver's state machine, and the driver will not know the chip's state changed.
+    pub fn interface_mut(&mut self) -> &mut T {
+        &mut self.interface
+    }
+
     /// `true` if a data-chunk footer has reported `EXST = 1` (a `STATUS0` / `STATUS1` bit is set
     /// and unmasked, spec Section 7.3.7) and [`service_extended_status`](Self::service_extended_status)
     /// has not cleared it since.
