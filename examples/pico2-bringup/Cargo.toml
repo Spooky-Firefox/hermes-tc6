@@ -30,6 +30,10 @@ harness = false
 name = "wiring_probe"
 harness = false
 
+[[test]]
+name = "frames"
+harness = false
+
 [dependencies]
 hermes-tc6 = { path = "../..", features = ["defmt"] }
 heapless = "0.9.3"
@@ -57,3 +61,5 @@ debug = 2
 
 [dev-dependencies]
 embedded-test = { version = "0.7.3", features = ["defmt"] }
+# For the `phy::Device` trait the frame tests drive. Same minimal feature set as the library.
+smoltcp = { version = "0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-udp"] }

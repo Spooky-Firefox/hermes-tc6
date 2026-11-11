@@ -862,10 +862,14 @@ where
                 // also this is the start of data transmission, sv = 1, swo = 0.
                 header = header.with_sv(true);
                 header = header.with_swo(0);
-                //safety: we are reading from a valid index, we might read more than what is initialized, but the swo and ebo will tell the tc6 chip how much of the data is valid, so it will ignore the rest
+                // SAFETY: the 64-byte window may run past the frame's initialized bytes (a frame
+                // shorter than one block, e.g. a 42-byte ARP request) into spare capacity, which
+                // is why this is `get_mut_at_index` (bounded by M) rather than
+                // `get_raw_mut_from_index` (bounded by the frame length, which panicked). The
+                // chip ignores bytes past `ebo`.
                 let data = unsafe {
                     DMAPtr::from_slice(
-                        frame.get_raw_mut_from_index(self.current_transmit_buffer_cursor, 64),
+                        frame.get_mut_at_index(self.current_transmit_buffer_cursor, 64),
                     )
                 };
 
@@ -2289,6 +2293,35 @@ mod driver_tests {
             hi.driver_state,
             TC6DriverState::WaitingForTransmitComplete
         ));
+    }
+
+    /// A frame shorter than one 64-byte block (e.g. smoltcp's 42-byte ARP request) still goes
+    /// out as a single chunk; the bytes past the frame end are don't-care, EBO marks the last
+    /// valid one. Panicked on silicon before the first-chunk path stopped requiring a full
+    /// 64 initialized bytes.
+    #[test]
+    fn transmits_frame_shorter_than_one_block() {
+        setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true; // data-path test: pretend configure() ran
+
+        let payload = ethernet_like(42);
+        {
+            let tok = lo.transmit(Instant::ZERO).expect("tx token");
+            tok.consume(payload.len(), |buf| buf.copy_from_slice(&payload));
+        }
+
+        hi.on_transmit_ready().unwrap();
+
+        assert_eq!(hi.interface.chunks.len(), 1, "exactly one chunk sent");
+        let c = hi.interface.last();
+        assert!(!c.joined);
+        assert_eq!(&c.data[..42], payload.as_slice());
+
+        let h = tc6_header::TransmitHeader::from_raw(c.header);
+        assert!(h.dnc() && h.dv() && h.sv() && h.ev());
+        assert_eq!(h.swo(), 0);
+        assert_eq!(h.ebo(), 41, "last valid byte is at payload offset 41");
+        assert!(h.parity_ok());
     }
 
     #[test]

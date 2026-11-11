@@ -166,7 +166,9 @@ Features that are advertised by the chip but **not implemented yet** are rejecte
 Hardware bring-up has started: on 2026-11-03 `configure()` returned `Ok` against a real LAN8651
 on a Raspberry Pi Pico 2 (see [Hardware bring-up](#hardware-bring-up-pico-2--lan8651)), and an
 18-test on-target suite (control path, reset handling, PLCA registers, footer layout, error
-injection, SPI up to 25 MHz) passes. Frame TX/RX has not been exercised on hardware yet.
+injection, SPI up to 25 MHz) passes. Since 2026-11-11 frames go both ways between two LAN8651s
+on a twisted pair (42 to 1514 bytes, single and multi-chunk, three queued frames in order), see
+`tests/frames.rs`.
 
 `todo.md` tracks the full list. Highlights:
 
@@ -181,8 +183,13 @@ injection, SPI up to 25 MHz) passes. Frame TX/RX has not been exercised on hardw
   cut-through, `CONFIG0.PROTE` protected control transfers, SEQ-bit chunk retransmission.
 - Pre-existing clippy warnings (missing `# Safety` docs, etc.) are unresolved.
 - `fake_tc6` is written from the same reading of the spec as the driver, so a shared
-  misinterpretation is invisible to the tests. The first real-hardware milestone (`configure()`
-  returning `Ok` on a physical chip) is done; the data path is next.
+  misinterpretation is invisible to the tests. Silicon now covers bring-up and the polled data
+  path; the interrupt-driven path and smoltcp on top are not tested on hardware yet.
+- **Received frames include the 4-byte FCS** on the LAN8651 as configured today, so smoltcp
+  gets 4 trailing bytes per frame. Either the MAC should be set to strip it or the driver should
+  trim it.
+- **The LAN865x MAC has to be enabled** (`MAC_NCR` TXEN/RXEN, MMS 1) before frames move. The
+  driver doesn't do this yet; `examples/pico2-bringup` has `enable_mac()` for now.
 - **No vendor-specific init for the LAN8650/1.** The driver only does the generic TC6
   bring-up. Microchip specifies extra configuration writes for these parts (Microchip's Linux
   PHY driver applies a rev-B init sequence). Until that is added, don't trust electrical
@@ -208,6 +215,9 @@ dependencies. It has three parts:
   A, see below. Chip B is held in reset so it stays silent on the cable.
 - `tests/two_board.rs` (`cargo test --test two_board`): chip B identity, crossed-line checks, SPI
   sweep on chip B, and a PLCA BEACON check across the cable in both directions. Needs both chips connected.
+- `tests/frames.rs` (`cargo test --test frames`): frames between the chips through the smoltcp
+  `phy::Device` API, both directions, checking bytes, order and that nothing is re-sent. Both
+  drivers are polled; MACs are enabled and promiscuous.
 - `tests/wiring_probe.rs` (`cargo test --test wiring_probe`): GPIO-only line checks for when a
   chip doesn't answer. It always passes; read the log.
 
@@ -222,9 +232,10 @@ dependencies. It has three parts:
 
 The two chips share power and are joined by a twisted pair, terminated at both ends.
 
-Status (2026-11-04): `two_board` passes 6/6 with both chips on the cable. Each chip reports PLCA
-inactive as a follower until the other starts as coordinator, then active, in both directions.
-Frames have not been sent between the chips yet.
+Status (2026-11-11): `two_board` passes 6/6 and `frames` 8/8 with both chips on the cable. Each
+chip reports PLCA inactive as a follower until the other starts as coordinator, then active, in
+both directions. Frames of 42, 60, 128, 129, 300 and 1514 bytes arrive intact and exactly once;
+the 42-byte frame arrives padded to 60, and every frame carries its FCS.
 
 ```sh
 cd examples/pico2-bringup

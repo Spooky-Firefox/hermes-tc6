@@ -733,6 +733,7 @@ dependencies = [
  "hermes-tc6",
  "panic-probe",
  "rp235x-hal",
+ "smoltcp",
 ]
 
 [[package]]

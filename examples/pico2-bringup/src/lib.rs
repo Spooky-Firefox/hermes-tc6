@@ -388,6 +388,41 @@ pub fn write_reg<T: Tc6Interface>(
     Ok(r.values()[0])
 }
 
+/// LAN865x MAC registers (MMS 1). These are Microchip-specific, not part of TC6, and the driver
+/// doesn't touch them yet. Addresses and bits come from the Linux `lan865x` driver; check them
+/// against the LAN8650/1 datasheet before relying on them.
+pub mod lan865x {
+    /// MAC network control register.
+    pub const MAC_NCR: u16 = 0x0000;
+    pub const NCR_RXEN: u32 = 1 << 2;
+    pub const NCR_TXEN: u32 = 1 << 3;
+    /// MAC network configuration register.
+    pub const MAC_NCFG: u16 = 0x0001;
+    /// Copy all frames (promiscuous).
+    pub const NCFG_CAF: u32 = 1 << 4;
+}
+
+/// Turn on the LAN865x MAC's transmitter and receiver (read-modify-write of `MAC_NCR`), and
+/// optionally promiscuous receive. Returns `(NCR, NCFG)` as read before the change.
+pub fn enable_mac<T: Tc6Interface>(
+    hi: &mut Driver<T>,
+    promiscuous: bool,
+) -> Result<(u32, u32), RegError> {
+    use hermes_tc6::registers::mms;
+    let ncr = read_reg(hi, mms::MAC, lan865x::MAC_NCR)?;
+    let ncfg = read_reg(hi, mms::MAC, lan865x::MAC_NCFG)?;
+    if promiscuous {
+        write_reg(hi, mms::MAC, lan865x::MAC_NCFG, ncfg | lan865x::NCFG_CAF)?;
+    }
+    write_reg(
+        hi,
+        mms::MAC,
+        lan865x::MAC_NCR,
+        ncr | lan865x::NCR_TXEN | lan865x::NCR_RXEN,
+    )?;
+    Ok((ncr, ncfg))
+}
+
 /// Raw SPI access that bypasses the driver - for checking the wire format against silicon and
 /// for deliberately malformed transactions. Only use while the driver is idle.
 pub mod raw {
