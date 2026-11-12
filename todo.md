@@ -24,7 +24,8 @@ is next.
 - [ ] **`resync_timer` / CSn hold on data ↔ control switch** (spec §7.2, §7.5.2). The host must
       hold CSn deasserted ≥ the MAC-PHY's `resync_timer` when switching between a data
       transaction and a control transaction. Currently unenforced — `handle_idle` starts a
-      control transaction mid data-path (`service_extended_status`, user `begin_register_read`)
+      control transaction mid data-path (`service_extended_status`, user `begin_register_read`,
+      the blocking `read_register` / `write_register` family)
       with no delay.
       - [ ] Add a `mode_barrier()` hook (or a `mode` arg on the `begin_*` calls) to
             `Tc6Interface`, called by the driver only at a data↔control edge. Blocking impl:

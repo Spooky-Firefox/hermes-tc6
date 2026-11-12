@@ -22,7 +22,7 @@ mod tests {
     use defmt::{Debug2Format, assert, assert_eq, info};
     use pico2_bringup::hermes_tc6::registers::{PlcaStatus, Status0, addr, mms, plca};
     use pico2_bringup::hermes_tc6::tc6_driver::{Config, PlcaConfig};
-    use pico2_bringup::{self as board, Boards, raw, read_reg};
+    use pico2_bringup::{self as board, Boards, raw};
 
     const EXPECTED_IDVER: u32 = 0x0000_0011;
     /// PHYID without the revision nibble: Microchip OUI slice + LAN865x model.
@@ -182,7 +182,7 @@ mod tests {
         }
         b.ctl_b.delay_ms(PLCA_SETTLE_MS);
         let before =
-            PlcaStatus::from_raw(read_reg(&mut hi_b, mms::PHY_VS_PLCA, plca::STATUS).unwrap());
+            PlcaStatus::from_raw(hi_b.read_register(mms::PHY_VS_PLCA, plca::STATUS).unwrap());
         info!("B PLCA STATUS with A silent: {=u32:#06x}", before.raw());
         assert!(
             !before.pst(),
@@ -198,9 +198,9 @@ mod tests {
             defmt::panic!("chip A configure() failed: {}", Debug2Format(&e));
         }
         b.ctl_b.delay_ms(PLCA_SETTLE_MS);
-        let a = PlcaStatus::from_raw(read_reg(&mut hi_a, mms::PHY_VS_PLCA, plca::STATUS).unwrap());
+        let a = PlcaStatus::from_raw(hi_a.read_register(mms::PHY_VS_PLCA, plca::STATUS).unwrap());
         let after =
-            PlcaStatus::from_raw(read_reg(&mut hi_b, mms::PHY_VS_PLCA, plca::STATUS).unwrap());
+            PlcaStatus::from_raw(hi_b.read_register(mms::PHY_VS_PLCA, plca::STATUS).unwrap());
         info!(
             "A PLCA STATUS {=u32:#06x}, B PLCA STATUS {=u32:#06x}",
             a.raw(),
@@ -224,7 +224,7 @@ mod tests {
         }
         b.ctl_a.delay_ms(PLCA_SETTLE_MS);
         let before =
-            PlcaStatus::from_raw(read_reg(&mut hi_a, mms::PHY_VS_PLCA, plca::STATUS).unwrap());
+            PlcaStatus::from_raw(hi_a.read_register(mms::PHY_VS_PLCA, plca::STATUS).unwrap());
         info!("A PLCA STATUS with B silent: {=u32:#06x}", before.raw());
         assert!(
             !before.pst(),
@@ -240,9 +240,9 @@ mod tests {
             defmt::panic!("chip B configure() failed: {}", Debug2Format(&e));
         }
         b.ctl_a.delay_ms(PLCA_SETTLE_MS);
-        let s = PlcaStatus::from_raw(read_reg(&mut hi_b, mms::PHY_VS_PLCA, plca::STATUS).unwrap());
+        let s = PlcaStatus::from_raw(hi_b.read_register(mms::PHY_VS_PLCA, plca::STATUS).unwrap());
         let after =
-            PlcaStatus::from_raw(read_reg(&mut hi_a, mms::PHY_VS_PLCA, plca::STATUS).unwrap());
+            PlcaStatus::from_raw(hi_a.read_register(mms::PHY_VS_PLCA, plca::STATUS).unwrap());
         info!(
             "B PLCA STATUS {=u32:#06x}, A PLCA STATUS {=u32:#06x}",
             s.raw(),

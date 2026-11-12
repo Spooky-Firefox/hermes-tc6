@@ -80,6 +80,36 @@ pub enum ControlError<E> {
     Interface(E),
 }
 
+/// Error from the blocking register functions on [`TC6HighPrio`]
+/// ([`read_register`](TC6HighPrio::read_register) and friends).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterError<E> {
+    /// The driver is mid-transfer: a control transaction is queued or in flight, or a data
+    /// chunk is still in flight (a DMA interface mid-transfer, or
+    /// [`on_interrupt`](TC6HighPrio::on_interrupt) stopped at its step cap). Call `on_interrupt`
+    /// and retry.
+    Busy,
+    /// The requested register count is zero or exceeds [`CONTROL_MAX_REGS`].
+    UnsupportedCount,
+    /// The transfer never reported complete within [`Config::transfer_poll_limit`]. The state
+    /// machine is returned to idle, but a genuinely stuck transfer may still be running on the
+    /// interface.
+    Timeout,
+    /// The MAC-PHY rejected the control command header (HDRB set, or the echo failed its parity
+    /// check). No register was accessed.
+    HeaderRejected,
+    /// A write's echoed data (TC6 spec 7.4.4) differs from what was sent, at register offset
+    /// `index`: a bit error on MOSI or MISO. If it was MOSI, the chip wrote the corrupted value,
+    /// so write it again or read it back.
+    EchoMismatch { index: u8 },
+    /// The underlying interface failed to run the transfer.
+    Interface(E),
+}
+
+/// Default for [`Config::transfer_poll_limit`], also used by the blocking register functions
+/// before [`TC6HighPrio::configure`] has run.
+const DEFAULT_TRANSFER_POLL_LIMIT: u32 = 100_000;
+
 /// A register read/write request accepted but not yet put on the wire.
 struct PendingControl {
     /// `true` = write (WNR = 1), `false` = read.
@@ -237,7 +267,9 @@ pub struct Config {
     /// MAC-PHY was just hardware-reset / power-cycled and issues its own reset otherwise.
     pub software_reset: bool,
     /// Max busy-wait iterations for a single control transfer to report complete before
-    /// [`configure`](TC6HighPrio::configure) gives up with [`ConfigError::Timeout`].
+    /// [`configure`](TC6HighPrio::configure) gives up with [`ConfigError::Timeout`]. `configure`
+    /// also keeps it for the blocking register functions
+    /// ([`read_register`](TC6HighPrio::read_register) and friends).
     pub transfer_poll_limit: u32,
     /// Max `STATUS0` re-reads waiting for `RESETC` before [`ConfigError::ResetNotComplete`].
     pub reset_poll_limit: u32,
@@ -253,7 +285,7 @@ impl Default for Config {
             plca: None,
             interrupt_mask: registers::IMask0::RESET_VALUE,
             software_reset: true,
-            transfer_poll_limit: 100_000,
+            transfer_poll_limit: DEFAULT_TRANSFER_POLL_LIMIT,
             reset_poll_limit: 64,
         }
     }
@@ -342,6 +374,9 @@ where
     // unmasked, spec Section 7.3.7 / 7.7). Cleared by `service_extended_status`, which reads
     // STATUS0 and write-1-to-clears it, and by `configure`.
     extended_status_pending: bool,
+    // Poll budget for the blocking register functions: `Config::transfer_poll_limit` from the
+    // last `configure`, or the default before that.
+    transfer_poll_limit: u32,
 }
 
 /// Owned by the low-priority context (e.g. `idle`): implements `smoltcp::phy::Device`.
@@ -387,7 +422,10 @@ where
             M >= MIN_FRAME_BUFFER_CAPACITY,
             "FrameBuffer capacity M is too small - see MIN_FRAME_BUFFER_CAPACITY"
         );
-        assert!(NQ >= 2, "the frame queues need NQ >= 2 (usable capacity is NQ - 1)");
+        assert!(
+            NQ >= 2,
+            "the frame queues need NQ >= 2 (usable capacity is NQ - 1)"
+        );
     }
 
     debug!(
@@ -419,6 +457,7 @@ where
             rx_chunks_available: 0,
             tx_credits: 0,
             extended_status_pending: false,
+            transfer_poll_limit: DEFAULT_TRANSFER_POLL_LIMIT,
         },
         TC6LowPrio {
             rx_ready_consumer,
@@ -1012,6 +1051,109 @@ where
         })
     }
 
+    // --- blocking register access ---
+    //
+    // The `begin_register_*` / `take_control_result` pair above suits interrupt-driven or async
+    // code. These run one control transaction to completion instead: they spin on
+    // `Tc6Interface::transfer_complete` (up to `Config::transfer_poll_limit` polls) and never
+    // enter the data path, so no frame is sent or received as a side effect. They work before
+    // `configure` too.
+
+    /// Read one register, blocking until the control transaction completes. See
+    /// [`read_registers`](Self::read_registers).
+    pub fn read_register(&mut self, mms: u8, addr: u16) -> Result<u32, RegisterError<T::Error>> {
+        let mut value = [0];
+        self.read_registers(mms, addr, &mut value)?;
+        Ok(value[0])
+    }
+
+    /// Read `out.len()` consecutive registers (`1..=`[`CONTROL_MAX_REGS`]) starting at `addr`
+    /// within memory map `mms`, in one control transaction, blocking until it completes.
+    ///
+    /// Returns [`RegisterError::Busy`] instead of waiting if a control transaction or data chunk
+    /// is already in flight.
+    pub fn read_registers(
+        &mut self,
+        mms: u8,
+        addr: u16,
+        out: &mut [u32],
+    ) -> Result<(), RegisterError<T::Error>> {
+        let count = Self::register_count(out.len())?;
+        let res = self.run_control_blocking(
+            PendingControl {
+                write: false,
+                mms,
+                addr,
+                count,
+                values: [0; CONTROL_MAX_REGS],
+            },
+            self.transfer_poll_limit,
+        )?;
+        if res.header_bad {
+            return Err(RegisterError::HeaderRejected);
+        }
+        out.copy_from_slice(res.values());
+        Ok(())
+    }
+
+    /// Write one register, blocking until the control transaction completes. See
+    /// [`write_registers`](Self::write_registers).
+    pub fn write_register(
+        &mut self,
+        mms: u8,
+        addr: u16,
+        value: u32,
+    ) -> Result<(), RegisterError<T::Error>> {
+        self.write_registers(mms, addr, &[value])
+    }
+
+    /// Write `values` (`1..=`[`CONTROL_MAX_REGS`]) to consecutive registers starting at `addr`
+    /// within memory map `mms`, in one control transaction, blocking until it completes.
+    ///
+    /// The MAC-PHY echoes the write data it received (TC6 spec 7.4.4); any difference from
+    /// `values` is reported as [`RegisterError::EchoMismatch`]. Returns
+    /// [`RegisterError::Busy`] instead of waiting if a control transaction or data chunk is
+    /// already in flight.
+    pub fn write_registers(
+        &mut self,
+        mms: u8,
+        addr: u16,
+        values: &[u32],
+    ) -> Result<(), RegisterError<T::Error>> {
+        let count = Self::register_count(values.len())?;
+        let mut buf = [0u32; CONTROL_MAX_REGS];
+        buf[..values.len()].copy_from_slice(values);
+        let res = self.run_control_blocking(
+            PendingControl {
+                write: true,
+                mms,
+                addr,
+                count,
+                values: buf,
+            },
+            self.transfer_poll_limit,
+        )?;
+        if res.header_bad {
+            return Err(RegisterError::HeaderRejected);
+        }
+        if let Some(index) = res.values().iter().zip(values).position(|(e, v)| e != v) {
+            warn!(
+                "tc6: write to mms={} addr={:#06x}: echoed data differs at offset {}",
+                mms, addr, index
+            );
+            return Err(RegisterError::EchoMismatch { index: index as u8 });
+        }
+        Ok(())
+    }
+
+    fn register_count(len: usize) -> Result<u8, RegisterError<T::Error>> {
+        if len == 0 || len > CONTROL_MAX_REGS {
+            warn!("tc6: register request with unsupported count {}", len);
+            return Err(RegisterError::UnsupportedCount);
+        }
+        Ok(len as u8)
+    }
+
     fn queue_control(&mut self, req: PendingControl) -> Result<(), ControlError<T::Error>> {
         if self.control_busy() {
             trace!("tc6: register request rejected - control path busy");
@@ -1247,6 +1389,7 @@ where
             warn!("tc6: configure() called while a control transaction is busy");
             return Err(ConfigError::Busy);
         }
+        self.transfer_poll_limit = cfg.transfer_poll_limit;
 
         // 0. software reset. SYNC only clears on a reset, so without this an MCU-only reboot
         //    (PHY still configured, RESETC already clear) would never satisfy step 1. The reset
@@ -1286,8 +1429,7 @@ where
 
         // 2. is anyone home? An all-zero / all-ones IDVER means the SPI bus itself is not
         //    working (no clock, MISO stuck, wrong mode / bit order) rather than "wrong chip".
-        let id_raw =
-            self.read_reg_blocking(mms::STANDARD, addr::IDVER, cfg.transfer_poll_limit)?;
+        let id_raw = self.read_reg_blocking(mms::STANDARD, addr::IDVER, cfg.transfer_poll_limit)?;
         if id_raw == 0x0000_0000 || id_raw == 0xFFFF_FFFF {
             error!(
                 "tc6: IDVER read back {:#010x} - SPI bus unresponsive (check clock / mode 0 / MSB-first / wiring)",
@@ -1442,16 +1584,18 @@ where
         addr: u16,
         poll_limit: u32,
     ) -> Result<u32, ConfigError<T::Error>> {
-        let res = self.run_control_blocking(
-            PendingControl {
-                write: false,
-                mms,
-                addr,
-                count: 1,
-                values: [0; CONTROL_MAX_REGS],
-            },
-            poll_limit,
-        )?;
+        let res = self
+            .run_control_blocking(
+                PendingControl {
+                    write: false,
+                    mms,
+                    addr,
+                    count: 1,
+                    values: [0; CONTROL_MAX_REGS],
+                },
+                poll_limit,
+            )
+            .map_err(Self::config_err)?;
         if res.header_bad {
             warn!(
                 "tc6: MAC-PHY rejected control header for read mms={} addr={:#06x}",
@@ -1471,16 +1615,18 @@ where
     ) -> Result<(), ConfigError<T::Error>> {
         let mut values = [0; CONTROL_MAX_REGS];
         values[0] = value;
-        let res = self.run_control_blocking(
-            PendingControl {
-                write: true,
-                mms,
-                addr,
-                count: 1,
-                values,
-            },
-            poll_limit,
-        )?;
+        let res = self
+            .run_control_blocking(
+                PendingControl {
+                    write: true,
+                    mms,
+                    addr,
+                    count: 1,
+                    values,
+                },
+                poll_limit,
+            )
+            .map_err(Self::config_err)?;
         if res.header_bad {
             warn!(
                 "tc6: MAC-PHY rejected control header for write mms={} addr={:#06x}",
@@ -1491,27 +1637,48 @@ where
         Ok(())
     }
 
+    /// Map a blocking-transaction error onto [`ConfigError`] for the bring-up helpers above,
+    /// which only issue single-register transactions and don't check write echoes.
+    fn config_err(e: RegisterError<T::Error>) -> ConfigError<T::Error> {
+        match e {
+            RegisterError::Busy => ConfigError::Busy,
+            RegisterError::Timeout => ConfigError::Timeout,
+            RegisterError::HeaderRejected => ConfigError::HeaderRejected,
+            RegisterError::Interface(e) => ConfigError::Interface(e),
+            RegisterError::UnsupportedCount | RegisterError::EchoMismatch { .. } => {
+                unreachable!("bring-up helpers use count 1 and skip the echo check")
+            }
+        }
+    }
+
     /// Issue one control transaction and spin on [`Tc6Interface::transfer_complete`] until it
     /// finishes or `poll_limit` iterations elapse. Never enters the data path.
+    ///
+    /// Refuses with [`RegisterError::Busy`] unless the driver is fully idle: starting a control
+    /// transaction while a data chunk is in flight would overwrite that chunk's state and lose
+    /// its footer.
     fn run_control_blocking(
         &mut self,
         req: PendingControl,
         poll_limit: u32,
-    ) -> Result<ControlResult, ConfigError<T::Error>> {
-        debug_assert!(!self.control_busy(), "run_control_blocking while busy");
+    ) -> Result<ControlResult, RegisterError<T::Error>> {
+        if self.control_busy() || !matches!(self.driver_state, TC6DriverState::Idle) {
+            warn!("tc6: blocking control transaction refused - driver busy");
+            return Err(RegisterError::Busy);
+        }
         self.pending_control = Some(req);
         self.start_control_transaction()
-            .map_err(ConfigError::Interface)?;
+            .map_err(RegisterError::Interface)?;
 
         let mut spins = 0u32;
         loop {
             if self
                 .interface
                 .transfer_complete()
-                .map_err(ConfigError::Interface)?
+                .map_err(RegisterError::Interface)?
             {
                 self.handle_control_complete()
-                    .map_err(ConfigError::Interface)?;
+                    .map_err(RegisterError::Interface)?;
                 return Ok(self
                     .last_control_result
                     .take()
@@ -1526,7 +1693,7 @@ where
                 // don't leave the state machine wedged in WaitingForControlComplete
                 self.control_in_flight = None;
                 self.driver_state = TC6DriverState::Idle;
-                return Err(ConfigError::Timeout);
+                return Err(RegisterError::Timeout);
             }
         }
     }
@@ -1735,6 +1902,9 @@ mod driver_tests {
         chunks: Vec<Chunk>,
         control_txns: Vec<ControlTxn>,
         complete: bool,
+        /// If set, answers every control transaction as soon as it starts (MOSI in, MISO out)
+        /// and raises completion, so the driver's blocking register functions can be driven.
+        control_reply: Option<fn(&[u8], &mut [u8])>,
         /// footers handed back by `respond` carry SYNC = 1 (a configured chip) unless cleared
         footer_sync: bool,
     }
@@ -1745,6 +1915,7 @@ mod driver_tests {
                 chunks: Vec::new(),
                 control_txns: Vec::new(),
                 complete: false,
+                control_reply: None,
                 footer_sync: true,
             }
         }
@@ -1895,6 +2066,14 @@ mod driver_tests {
                 "at least header + 1 word + pad"
             );
             let tx = unsafe { core::slice::from_raw_parts(d_ptr, d_len) }.to_vec();
+            if let Some(reply) = self.control_reply {
+                // SAFETY: same rationale as `respond` - the driver's MISO buffer is alive and
+                // un-aliased until it sees completion.
+                reply(&tx, unsafe {
+                    core::slice::from_raw_parts_mut(r_ptr, r_len)
+                });
+                self.complete = true;
+            }
             self.control_txns.push(ControlTxn {
                 tx,
                 result_ptr: r_ptr,
@@ -2173,8 +2352,15 @@ mod driver_tests {
         setup!(_hi, lo, SpyInterface::default(), NoopSignal);
         let caps = lo.capabilities();
         assert_eq!(caps.medium, Medium::Ethernet);
-        assert_eq!(caps.max_transmission_unit, 1514, "Ethernet header + 1500 payload, no FCS");
-        assert_eq!(caps.max_burst_size, Some(NQ - 1), "usable tx-ready queue depth");
+        assert_eq!(
+            caps.max_transmission_unit, 1514,
+            "Ethernet header + 1500 payload, no FCS"
+        );
+        assert_eq!(
+            caps.max_burst_size,
+            Some(NQ - 1),
+            "usable tx-ready queue depth"
+        );
     }
 
     #[test]
@@ -3744,5 +3930,160 @@ mod driver_tests {
         );
         hi.handle_transmit_complete().unwrap();
         assert!(!hi.is_configured());
+    }
+
+    // --------------------------------------------------------------------------------------
+    // blocking register access (read_register / write_register and friends)
+    // --------------------------------------------------------------------------------------
+
+    /// Works before `configure`: the control path doesn't need SYNC.
+    #[test]
+    #[cfg(feature = "embedded-hal")]
+    fn blocking_read_register_reads_idver_before_configure() {
+        use crate::embedded_io_implementation::EmbeddedHalImplementation;
+        use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
+
+        setup!(
+            hi,
+            _lo,
+            EmbeddedHalImplementation::new(FakeTc6SpiDevice::new()),
+            NoopSignal
+        );
+        assert!(matches!(hi.read_register(0, 0x0000), Ok(0x0000_0011)));
+        assert!(!hi.control_busy());
+    }
+
+    /// A two-register write lands in both registers, and one two-register read returns both.
+    #[test]
+    #[cfg(feature = "embedded-hal")]
+    fn blocking_multi_register_write_then_read_back() {
+        use crate::embedded_io_implementation::EmbeddedHalImplementation;
+        use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
+
+        setup!(
+            hi,
+            _lo,
+            EmbeddedHalImplementation::new(FakeTc6SpiDevice::new()),
+            NoopSignal
+        );
+        // IMASK0 / IMASK1 are adjacent plain read-write registers in the fake.
+        hi.write_registers(0, 0x000C, &[0x0000_0ABC, 0x0000_0123])
+            .expect("write");
+        let mut back = [0u32; 2];
+        hi.read_registers(0, 0x000C, &mut back).expect("read");
+        assert_eq!(back, [0x0000_0ABC, 0x0000_0123]);
+        assert_eq!(hi.interface.inner_mut().device.read_reg(0, 0x000D), 0x123);
+    }
+
+    #[test]
+    fn blocking_register_functions_reject_bad_counts_without_a_transaction() {
+        setup!(hi, _lo, SpyInterface::default(), NoopSignal);
+        assert_eq!(
+            hi.read_registers(0, 0, &mut []),
+            Err(RegisterError::UnsupportedCount)
+        );
+        assert_eq!(
+            hi.read_registers(0, 0, &mut [0; CONTROL_MAX_REGS + 1]),
+            Err(RegisterError::UnsupportedCount)
+        );
+        assert_eq!(
+            hi.write_registers(0, 0, &[]),
+            Err(RegisterError::UnsupportedCount)
+        );
+        assert!(hi.interface.control_txns.is_empty());
+    }
+
+    /// A queued non-blocking request owns the control path until its result is taken.
+    #[test]
+    fn blocking_read_is_busy_while_a_queued_request_is_in_flight() {
+        setup!(hi, _lo, SpyInterface::default(), NoopSignal);
+        hi.begin_register_read(0, 0x0000, 1).expect("queued");
+        assert_eq!(hi.read_register(0, 0x0000), Err(RegisterError::Busy));
+        assert_eq!(hi.interface.control_txns.len(), 1, "no second transaction");
+    }
+
+    /// Starting a control transaction mid data chunk would lose that chunk's footer, so both
+    /// the register functions and `configure` refuse.
+    #[test]
+    fn blocking_access_is_busy_while_a_data_chunk_is_in_flight() {
+        setup!(hi, lo, SpyInterface::default(), NoopSignal);
+        hi.sync_established = true; // data-path test: pretend configure() ran
+        let payload = ethernet_like(64);
+        lo.transmit(Instant::ZERO)
+            .expect("tx token")
+            .consume(payload.len(), |buf| buf.copy_from_slice(&payload));
+        hi.on_transmit_ready().unwrap();
+        assert!(matches!(
+            hi.driver_state,
+            TC6DriverState::WaitingForTransmitComplete
+        ));
+
+        assert_eq!(hi.read_register(0, 0x0000), Err(RegisterError::Busy));
+        assert_eq!(hi.write_register(0, 0x000C, 0), Err(RegisterError::Busy));
+        assert_eq!(hi.configure(&Config::default()), Err(ConfigError::Busy));
+        assert!(hi.interface.control_txns.is_empty());
+    }
+
+    #[test]
+    fn blocking_read_times_out_and_leaves_the_driver_idle() {
+        setup!(hi, _lo, SpyInterface::default(), NoopSignal);
+        hi.transfer_poll_limit = 10; // the spy never completes
+        assert_eq!(hi.read_register(0, 0x0000), Err(RegisterError::Timeout));
+        assert!(!hi.control_busy());
+        assert!(matches!(hi.driver_state, TC6DriverState::Idle));
+    }
+
+    #[test]
+    #[cfg(feature = "embedded-hal")]
+    fn blocking_read_reports_a_rejected_header() {
+        use crate::embedded_io_implementation::EmbeddedHalImplementation;
+        use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
+
+        let mut spi = FakeTc6SpiDevice::new();
+        spi.device.force_bad_control_header = true;
+        setup!(hi, _lo, EmbeddedHalImplementation::new(spi), NoopSignal);
+        assert!(matches!(
+            hi.read_register(0, 0x0000),
+            Err(RegisterError::HeaderRejected)
+        ));
+        assert!(!hi.control_busy());
+    }
+
+    /// A bit flipped in the echoed write data (spec 7.4.4) is reported with its offset.
+    #[test]
+    fn blocking_write_reports_an_echo_mismatch() {
+        setup!(hi, _lo, SpyInterface::default(), NoopSignal);
+        hi.interface.control_reply = Some(|tx, rx| {
+            // MISO = [don't care][echoed header][echoed data...]; corrupt the second word.
+            let n = tx.len() / 4 - 2;
+            rx[4..8 + 4 * n].copy_from_slice(&tx[..4 + 4 * n]);
+            rx[8 + 4 + 3] ^= 0x01;
+        });
+        assert_eq!(
+            hi.write_registers(0, 0x000C, &[0x11, 0x22]),
+            Err(RegisterError::EchoMismatch { index: 1 })
+        );
+        assert!(!hi.control_busy());
+    }
+
+    #[test]
+    #[cfg(feature = "embedded-hal")]
+    fn configure_keeps_the_transfer_poll_limit_for_blocking_access() {
+        use crate::embedded_io_implementation::EmbeddedHalImplementation;
+        use fake_tc6::fake_tc6_device::FakeTc6SpiDevice;
+
+        setup!(
+            hi,
+            _lo,
+            EmbeddedHalImplementation::new(FakeTc6SpiDevice::new()),
+            NoopSignal
+        );
+        assert_eq!(hi.transfer_poll_limit, DEFAULT_TRANSFER_POLL_LIMIT);
+        let cfg = Config {
+            transfer_poll_limit: 1234,
+            ..Config::default()
+        };
+        hi.configure(&cfg).expect("bring-up");
+        assert_eq!(hi.transfer_poll_limit, 1234);
     }
 }

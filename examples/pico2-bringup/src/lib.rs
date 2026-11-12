@@ -31,7 +31,7 @@ use rp235x_hal::{
 pub use hermes_tc6;
 use hermes_tc6::embedded_io_implementation::EmbeddedHalImplementation;
 use hermes_tc6::frame_buffer::FrameBuffer;
-use hermes_tc6::tc6_driver::{self, ControlError, TC6HighPrio, TC6LowPrio, TransmitSignal};
+use hermes_tc6::tc6_driver::{self, RegisterError, TC6HighPrio, TC6LowPrio, TransmitSignal};
 use hermes_tc6::tc6_footer::ReceiveFooter;
 use hermes_tc6::tc6_header::{ControlHeader, TransmitHeader};
 use hermes_tc6::tc6_interface::Tc6Interface;
@@ -324,70 +324,6 @@ pub fn take_driver_b(iface: IfaceB) -> (HiB, Lo) {
     tc6_driver::split::<_, RxP, TxP, _, M, NQ>(iface, rx_ready, tx_ready, FlagSignal(&TX_PENDING_B))
 }
 
-/// Error from the pumped register helpers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
-pub enum RegError {
-    /// `begin_register_*` refused (busy / bad count / interface error).
-    Begin,
-    /// `on_interrupt` returned an interface error.
-    Interface,
-    /// The chip flagged the control header as bad (HDRB / echo parity).
-    HeaderBad,
-    /// No result after the poll budget.
-    Timeout,
-}
-
-fn pump<T: Tc6Interface>(hi: &mut Driver<T>) -> Result<tc6_driver::ControlResult, RegError> {
-    for _ in 0..1000 {
-        hi.on_interrupt().map_err(|_| RegError::Interface)?;
-        if let Some(r) = hi.take_control_result() {
-            if r.header_bad {
-                return Err(RegError::HeaderBad);
-            }
-            return Ok(r);
-        }
-    }
-    Err(RegError::Timeout)
-}
-
-fn begin_err<E>(_: ControlError<E>) -> RegError {
-    RegError::Begin
-}
-
-/// Read `out.len()` consecutive registers through the driver's control path.
-pub fn read_regs<T: Tc6Interface>(
-    hi: &mut Driver<T>,
-    mms: u8,
-    addr: u16,
-    out: &mut [u32],
-) -> Result<(), RegError> {
-    hi.begin_register_read(mms, addr, out.len() as u8)
-        .map_err(begin_err)?;
-    let r = pump(hi)?;
-    out.copy_from_slice(r.values());
-    Ok(())
-}
-
-/// Read one register through the driver's control path.
-pub fn read_reg<T: Tc6Interface>(hi: &mut Driver<T>, mms: u8, addr: u16) -> Result<u32, RegError> {
-    let mut v = [0];
-    read_regs(hi, mms, addr, &mut v)?;
-    Ok(v[0])
-}
-
-/// Write one register through the driver's control path; returns the echoed write data.
-pub fn write_reg<T: Tc6Interface>(
-    hi: &mut Driver<T>,
-    mms: u8,
-    addr: u16,
-    value: u32,
-) -> Result<u32, RegError> {
-    hi.begin_register_write(mms, addr, &[value])
-        .map_err(begin_err)?;
-    let r = pump(hi)?;
-    Ok(r.values()[0])
-}
-
 /// LAN865x MAC registers (MMS 1). These are Microchip-specific, not part of TC6, and the driver
 /// doesn't touch them yet. Addresses and bits come from the Linux `lan865x` driver; check them
 /// against the LAN8650/1 datasheet before relying on them.
@@ -407,15 +343,14 @@ pub mod lan865x {
 pub fn enable_mac<T: Tc6Interface>(
     hi: &mut Driver<T>,
     promiscuous: bool,
-) -> Result<(u32, u32), RegError> {
+) -> Result<(u32, u32), RegisterError<T::Error>> {
     use hermes_tc6::registers::mms;
-    let ncr = read_reg(hi, mms::MAC, lan865x::MAC_NCR)?;
-    let ncfg = read_reg(hi, mms::MAC, lan865x::MAC_NCFG)?;
+    let ncr = hi.read_register(mms::MAC, lan865x::MAC_NCR)?;
+    let ncfg = hi.read_register(mms::MAC, lan865x::MAC_NCFG)?;
     if promiscuous {
-        write_reg(hi, mms::MAC, lan865x::MAC_NCFG, ncfg | lan865x::NCFG_CAF)?;
+        hi.write_register(mms::MAC, lan865x::MAC_NCFG, ncfg | lan865x::NCFG_CAF)?;
     }
-    write_reg(
-        hi,
+    hi.write_register(
         mms::MAC,
         lan865x::MAC_NCR,
         ncr | lan865x::NCR_TXEN | lan865x::NCR_RXEN,
