@@ -33,7 +33,7 @@ mod tests {
     };
     use pico2_bringup::hermes_tc6::tc6_driver::{Config, ConfigError, PlcaConfig};
     use pico2_bringup::hermes_tc6::tc6_header::TransmitHeader;
-    use pico2_bringup::{self as board, Ctl, Iface, raw, read_reg, read_regs, write_reg};
+    use pico2_bringup::{self as board, Ctl, Iface, raw};
 
     /// Microchip LAN8650/1 as seen by the first bring-up (2026-11-03).
     const EXPECTED_IDVER: u32 = 0x0000_0011;
@@ -108,7 +108,7 @@ mod tests {
     #[timeout(10)]
     fn footer_after_configure_reports_sync_and_credits(state: State) {
         let (mut hi, _ctl) = configured(state, &Config::default());
-        let bufsts = BufSts::from_raw(read_reg(&mut hi, mms::STANDARD, addr::BUFSTS).unwrap());
+        let bufsts = BufSts::from_raw(hi.read_register(mms::STANDARD, addr::BUFSTS).unwrap());
         let (f, _) = raw::data_chunk(
             hi.interface_mut().inner_mut(),
             raw::empty_chunk_header(),
@@ -144,10 +144,10 @@ mod tests {
     fn configure_after_hw_reset(state: State) {
         let (mut hi, _ctl) = configured(state, &Config::default());
 
-        let id = IdVer::from_raw(read_reg(&mut hi, mms::STANDARD, addr::IDVER).unwrap());
+        let id = IdVer::from_raw(hi.read_register(mms::STANDARD, addr::IDVER).unwrap());
         assert_eq!((id.majver(), id.minver()), (1, 1));
 
-        let phy = PhyId::from_raw(read_reg(&mut hi, mms::STANDARD, addr::PHYID).unwrap());
+        let phy = PhyId::from_raw(hi.read_register(mms::STANDARD, addr::PHYID).unwrap());
         info!(
             "PHYID oui {=u32:#08x} model {=u8:#04x} rev {=u8}",
             phy.oui(),
@@ -157,11 +157,11 @@ mod tests {
         assert_eq!(phy.oui(), MICROCHIP_OUI_SLICE);
         assert_eq!(phy.model(), LAN865X_MODEL);
 
-        let c0 = Config0::from_raw(read_reg(&mut hi, mms::STANDARD, addr::CONFIG0).unwrap());
+        let c0 = Config0::from_raw(hi.read_register(mms::STANDARD, addr::CONFIG0).unwrap());
         assert!(c0.sync());
         assert_eq!(c0.cps_bytes(), 64);
 
-        let s0 = read_reg(&mut hi, mms::STANDARD, addr::STATUS0).unwrap();
+        let s0 = hi.read_register(mms::STANDARD, addr::STATUS0).unwrap();
         assert_eq!(s0, 0, "STATUS0 should be clear after configure");
     }
 
@@ -260,8 +260,8 @@ mod tests {
     // Control path
     // ------------------------------------------------------------------------------------------
 
-    /// Writes to IMASK0 echo back the written data and read back as written (RESETCM, bit 6,
-    /// is read-only 0).
+    /// Writes to IMASK0 echo back the written data (checked by `write_register`) and read back as
+    /// written (RESETCM, bit 6, is read-only 0).
     #[test]
     #[timeout(10)]
     fn imask0_write_readback(state: State) {
@@ -273,16 +273,15 @@ mod tests {
             0x0000_0AAA & writable,
             0x0000_1515 & writable,
         ] {
-            let echoed = write_reg(&mut hi, mms::STANDARD, addr::IMASK0, pattern).unwrap();
-            let back = read_reg(&mut hi, mms::STANDARD, addr::IMASK0).unwrap();
-            info!(
-                "IMASK0 wrote {=u32:#010x} echoed {=u32:#010x} read {=u32:#010x}",
-                pattern, echoed, back
-            );
-            assert_eq!(echoed, pattern, "echoed write data differs");
+            // write_register() itself fails if the echoed write data differs (spec 7.4.4)
+            hi.write_register(mms::STANDARD, addr::IMASK0, pattern)
+                .unwrap();
+            let back = hi.read_register(mms::STANDARD, addr::IMASK0).unwrap();
+            info!("IMASK0 wrote {=u32:#010x} read {=u32:#010x}", pattern, back);
             assert_eq!(back, pattern, "readback differs");
         }
-        write_reg(&mut hi, mms::STANDARD, addr::IMASK0, writable).unwrap();
+        hi.write_register(mms::STANDARD, addr::IMASK0, writable)
+            .unwrap();
     }
 
     /// Multi-register reads (address auto-increment) match the same registers read one by one.
@@ -292,12 +291,43 @@ mod tests {
         let (mut hi, _ctl) = configured(state, &Config::default());
         for count in [2usize, 3, 8] {
             let mut burst = [0u32; 8];
-            read_regs(&mut hi, mms::STANDARD, 0x0000, &mut burst[..count]).unwrap();
+            hi.read_registers(mms::STANDARD, 0x0000, &mut burst[..count])
+                .unwrap();
             for (i, &v) in burst[..count].iter().enumerate() {
-                let single = read_reg(&mut hi, mms::STANDARD, i as u16).unwrap();
+                let single = hi.read_register(mms::STANDARD, i as u16).unwrap();
                 assert_eq!(v, single, "count {}: reg {=usize:#06x} differs", count, i);
             }
         }
+    }
+
+    /// The non-blocking control path (`begin_register_read` + `on_interrupt` +
+    /// `take_control_result`) returns the same values as the blocking `read_registers`.
+    #[test]
+    #[timeout(10)]
+    fn non_blocking_register_read_matches_blocking(state: State) {
+        let (mut hi, _ctl) = configured(state, &Config::default());
+        let mut blocking = [0u32; 3];
+        hi.read_registers(mms::STANDARD, addr::IDVER, &mut blocking)
+            .unwrap();
+
+        hi.begin_register_read(mms::STANDARD, addr::IDVER, 3)
+            .unwrap();
+        let mut result = None;
+        for _ in 0..1000 {
+            hi.on_interrupt().unwrap();
+            result = hi.take_control_result();
+            if result.is_some() {
+                break;
+            }
+        }
+        let result = result.expect("no control result after 1000 on_interrupt calls");
+        assert!(!result.header_bad);
+        info!(
+            "blocking {=[?]:#010x}, non-blocking {=[?]:#010x}",
+            blocking,
+            result.values()
+        );
+        assert_eq!(result.values(), &blocking[..]);
     }
 
     /// The SPI clock sweep: 1000 raw IDVER reads per clock. Logs the error count per clock, and
@@ -342,7 +372,7 @@ mod tests {
     #[timeout(10)]
     fn plca_idver_is_open_alliance_map(state: State) {
         let (mut hi, _ctl) = configured(state, &Config::default());
-        let v = read_reg(&mut hi, mms::PHY_VS_PLCA, plca::IDVER).unwrap();
+        let v = hi.read_register(mms::PHY_VS_PLCA, plca::IDVER).unwrap();
         info!("PLCA IDVER = {=u32:#010x}", v);
         assert_eq!((v >> 8) & 0xFF, 0x0A, "not the OPEN Alliance PLCA map");
     }
@@ -356,8 +386,8 @@ mod tests {
             ..Config::default()
         };
         let (mut hi, mut ctl) = configured(state, &cfg);
-        let c0 = PlcaCtrl0::from_raw(read_reg(&mut hi, mms::PHY_VS_PLCA, plca::CTRL0).unwrap());
-        let c1 = PlcaCtrl1::from_raw(read_reg(&mut hi, mms::PHY_VS_PLCA, plca::CTRL1).unwrap());
+        let c0 = PlcaCtrl0::from_raw(hi.read_register(mms::PHY_VS_PLCA, plca::CTRL0).unwrap());
+        let c1 = PlcaCtrl1::from_raw(hi.read_register(mms::PHY_VS_PLCA, plca::CTRL1).unwrap());
         info!(
             "PLCA CTRL0 {=u32:#06x} CTRL1 {=u32:#06x}",
             c0.raw(),
@@ -368,7 +398,7 @@ mod tests {
         assert_eq!(c1.node_count(), 8);
 
         ctl.delay_ms(100);
-        let st = PlcaStatus::from_raw(read_reg(&mut hi, mms::PHY_VS_PLCA, plca::STATUS).unwrap());
+        let st = PlcaStatus::from_raw(hi.read_register(mms::PHY_VS_PLCA, plca::STATUS).unwrap());
         info!("PLCA STATUS {=u32:#06x}", st.raw());
         assert!(st.pst(), "lone coordinator should report PLCA active");
     }
@@ -383,8 +413,8 @@ mod tests {
             ..Config::default()
         };
         let (mut hi, mut ctl) = configured(state, &cfg);
-        let c0 = PlcaCtrl0::from_raw(read_reg(&mut hi, mms::PHY_VS_PLCA, plca::CTRL0).unwrap());
-        let c1 = PlcaCtrl1::from_raw(read_reg(&mut hi, mms::PHY_VS_PLCA, plca::CTRL1).unwrap());
+        let c0 = PlcaCtrl0::from_raw(hi.read_register(mms::PHY_VS_PLCA, plca::CTRL0).unwrap());
+        let c1 = PlcaCtrl1::from_raw(hi.read_register(mms::PHY_VS_PLCA, plca::CTRL1).unwrap());
         info!(
             "PLCA CTRL0 {=u32:#06x} CTRL1 {=u32:#06x}",
             c0.raw(),
@@ -394,7 +424,7 @@ mod tests {
         assert_eq!(c1.id(), 3);
 
         ctl.delay_ms(100);
-        let st = PlcaStatus::from_raw(read_reg(&mut hi, mms::PHY_VS_PLCA, plca::STATUS).unwrap());
+        let st = PlcaStatus::from_raw(hi.read_register(mms::PHY_VS_PLCA, plca::STATUS).unwrap());
         info!("PLCA STATUS {=u32:#06x}", st.raw());
         assert!(
             !st.pst(),
@@ -426,7 +456,7 @@ mod tests {
             "chip accepted a header with bad parity"
         );
 
-        let s0 = Status0::from_raw(read_reg(&mut hi, mms::STANDARD, addr::STATUS0).unwrap());
+        let s0 = Status0::from_raw(hi.read_register(mms::STANDARD, addr::STATUS0).unwrap());
         info!("STATUS0 {=u32:#010x}", s0.raw());
         assert!(s0.hdre(), "STATUS0.HDRE not set");
     }
@@ -441,7 +471,7 @@ mod tests {
         tx[..4].copy_from_slice(&raw::empty_chunk_header().raw().to_be_bytes());
         raw::transfer(hi.interface_mut().inner_mut(), &tx, &mut rx);
 
-        let s0 = Status0::from_raw(read_reg(&mut hi, mms::STANDARD, addr::STATUS0).unwrap());
+        let s0 = Status0::from_raw(hi.read_register(mms::STANDARD, addr::STATUS0).unwrap());
         info!("STATUS0 {=u32:#010x}", s0.raw());
         assert!(s0.lofe(), "STATUS0.LOFE not set");
     }
@@ -462,7 +492,7 @@ mod tests {
         let (f, _) = raw::data_chunk(hi.interface_mut().inner_mut(), header, &[0xA5; 64]);
         info!("footer {=u32:#010x}", f.raw());
 
-        let s0 = Status0::from_raw(read_reg(&mut hi, mms::STANDARD, addr::STATUS0).unwrap());
+        let s0 = Status0::from_raw(hi.read_register(mms::STANDARD, addr::STATUS0).unwrap());
         info!("STATUS0 {=u32:#010x}", s0.raw());
         if !s0.txpe() {
             warn!("no TXPE - check the LAN8651 datasheet for which chunk sequences it flags");

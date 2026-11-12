@@ -64,8 +64,13 @@ stream of minimum-size frames (on the order of ~1700 clock cycles per frame budg
 - The high-priority side is driven by `on_interrupt()` (call it from the chip's IRQ line
   *and* from SPI/DMA transfer-completion) and `on_transmit_ready()` (call it when
   `TransmitSignal::signal()` fires, i.e. the low-prio side queued a frame).
-- Register access goes through `begin_register_read()` / `begin_register_write()` on the
-  high-prio side; pump `on_interrupt()` and collect the result with `take_control_result()`.
+- Register access goes through the high-prio side, in one of two ways:
+  - Blocking: `read_register()` / `write_register()` (and the multi-register
+    `read_registers()` / `write_registers()`) run one control transaction to completion. They
+    never touch the data path, check the write echo, and work before `configure()`. They return
+    `RegisterError::Busy` if a transfer is already in flight.
+  - Non-blocking: `begin_register_read()` / `begin_register_write()` queue the transaction;
+    pump `on_interrupt()` and collect the result with `take_control_result()`.
 
 ---
 
@@ -206,7 +211,7 @@ See also the project memory note on known-broken paths pinned by `driver_tests`.
 dependencies. It has three parts:
 
 - `src/lib.rs`: board support shared by everything else. Pins/SPI setup, RESET_N / IRQ_N
-  helpers, the `'static` pools and queues (`take_driver()`), pumped register read/write helpers,
+  helpers, the `'static` pools and queues (`take_driver()`), the LAN865x MAC enable,
   and a `raw` module that talks SPI directly, bypassing the driver, for wire-format checks and
   error injection.
 - `src/main.rs` (`cargo run`): hardware-resets the MAC-PHY, configures it, dumps a few

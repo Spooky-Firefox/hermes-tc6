@@ -29,7 +29,7 @@ mod tests {
     use pico2_bringup::hermes_tc6::registers::{addr, mms};
     use pico2_bringup::hermes_tc6::tc6_driver::Config;
     use pico2_bringup::hermes_tc6::tc6_interface::Tc6Interface;
-    use pico2_bringup::{self as board, Ctl, CtlB, Driver, Hi, HiB, Lo, Timer, lan865x, read_reg};
+    use pico2_bringup::{self as board, Ctl, CtlB, Driver, Hi, HiB, Lo, Timer, lan865x};
     use smoltcp::phy::{Device, RxToken, TxToken};
     use smoltcp::time::Instant;
 
@@ -79,8 +79,8 @@ mod tests {
             defmt::panic!("{=str}: configure() failed: {}", name, Debug2Format(&e));
         }
         let (ncr, ncfg) = board::enable_mac(hi, true).unwrap();
-        let ncr_now = read_reg(hi, mms::MAC, lan865x::MAC_NCR).unwrap();
-        let ncfg_now = read_reg(hi, mms::MAC, lan865x::MAC_NCFG).unwrap();
+        let ncr_now = hi.read_register(mms::MAC, lan865x::MAC_NCR).unwrap();
+        let ncfg_now = hi.read_register(mms::MAC, lan865x::MAC_NCFG).unwrap();
         info!(
             "{=str}: MAC_NCR {=u32:#x} -> {=u32:#x}, MAC_NCFG {=u32:#x} -> {=u32:#x}",
             name, ncr, ncr_now, ncfg, ncfg_now
@@ -165,9 +165,9 @@ mod tests {
         irq_seen
     }
 
-    fn log_status<T: Tc6Interface>(hi: &mut Driver<T>, name: &str) {
-        let s0 = read_reg(hi, mms::STANDARD, addr::STATUS0).unwrap();
-        let buf = read_reg(hi, mms::STANDARD, addr::BUFSTS).unwrap();
+    fn log_status<T: Tc6Interface<Error: core::fmt::Debug>>(hi: &mut Driver<T>, name: &str) {
+        let s0 = hi.read_register(mms::STANDARD, addr::STATUS0).unwrap();
+        let buf = hi.read_register(mms::STANDARD, addr::BUFSTS).unwrap();
         info!(
             "{=str}: STATUS0 {=u32:#010x} BUFSTS {=u32:#010x} configured={}",
             name,
