@@ -34,6 +34,15 @@ is next.
       - [ ] Consider stopping CSn deassertion *between data chunks* entirely (one `transaction()`
             spanning a burst of `Operation`s). Removes the per-chunk resync constraint and is a
             throughput win. Bigger refactor.
+- [ ] **`Config::transfer_poll_limit` counts polls, not time.** The blocking control path
+      (`configure`, `service_extended_status`, `read_register` / `write_register` and friends)
+      spins on `transfer_complete()` up to N times. With the blocking `EmbeddedHalImplementation`
+      the first poll always succeeds, so it doesn't matter yet. With a DMA interface the real
+      timeout becomes N × (one poll on this CPU), so a fast CPU with a slow SPI clock can time
+      out a transfer that is still running. Documented on the field for now. Decide when the
+      DMA interface is written; it needs the same time source as the `resync_timer` item:
+      - [ ] Option: a timeout / `now()` hook on `Tc6Interface`.
+      - [ ] Option: the blocking functions take a deadline closure from the caller.
 - [ ] **Verify CSn stays asserted across the two `Operation::Transfer`s** in
       `EmbeddedHalImplementation::begin_send_block` (header, then payload). The `SpiDevice`
       contract says it must; real HAL impls vary. A gap here = loss-of-framing.

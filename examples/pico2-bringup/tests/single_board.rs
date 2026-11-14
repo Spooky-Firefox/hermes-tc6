@@ -302,30 +302,44 @@ mod tests {
 
     /// The non-blocking control path (`begin_register_read` + `on_interrupt` +
     /// `take_control_result`) returns the same values as the blocking `read_registers`.
+    ///
+    /// Polls against a time deadline, not a call count: with a DMA interface the number of
+    /// `on_interrupt` calls needed depends on CPU speed vs SPI speed. With the blocking
+    /// `EmbeddedHalImplementation` the transfer finishes inside `begin_register_read`, so one
+    /// call is expected; the count is logged.
     #[test]
     #[timeout(10)]
     fn non_blocking_register_read_matches_blocking(state: State) {
-        let (mut hi, _ctl) = configured(state, &Config::default());
+        const DEADLINE_MS: u64 = 100;
+        let (mut hi, ctl) = configured(state, &Config::default());
         let mut blocking = [0u32; 3];
         hi.read_registers(mms::STANDARD, addr::IDVER, &mut blocking)
             .unwrap();
 
         hi.begin_register_read(mms::STANDARD, addr::IDVER, 3)
             .unwrap();
-        let mut result = None;
-        for _ in 0..1000 {
+        let start = ctl.timer.get_counter();
+        let mut calls = 0u32;
+        let result = loop {
             hi.on_interrupt().unwrap();
-            result = hi.take_control_result();
-            if result.is_some() {
-                break;
+            calls += 1;
+            if let Some(r) = hi.take_control_result() {
+                break r;
             }
-        }
-        let result = result.expect("no control result after 1000 on_interrupt calls");
+            if (ctl.timer.get_counter() - start).to_millis() >= DEADLINE_MS {
+                defmt::panic!(
+                    "no control result within {=u64} ms ({=u32} on_interrupt calls)",
+                    DEADLINE_MS,
+                    calls
+                );
+            }
+        };
         assert!(!result.header_bad);
         info!(
-            "blocking {=[?]:#010x}, non-blocking {=[?]:#010x}",
+            "blocking {=[?]:#010x}, non-blocking {=[?]:#010x} after {=u32} on_interrupt call(s)",
             blocking,
-            result.values()
+            result.values(),
+            calls
         );
         assert_eq!(result.values(), &blocking[..]);
     }

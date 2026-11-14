@@ -270,6 +270,14 @@ pub struct Config {
     /// [`configure`](TC6HighPrio::configure) gives up with [`ConfigError::Timeout`]. `configure`
     /// also keeps it for the blocking register functions
     /// ([`read_register`](TC6HighPrio::read_register) and friends).
+    ///
+    /// This is a count of [`Tc6Interface::transfer_complete`] polls, **not a time**: the driver
+    /// has no clock. With a blocking interface such as `EmbeddedHalImplementation` the transfer
+    /// has already finished when it is started, so the first poll succeeds and the limit is
+    /// never reached. With a DMA/async interface each poll is one quick status check, so the
+    /// timeout in seconds shrinks as the CPU gets faster. Size it for the slowest case: the
+    /// longest control transaction (`4 * (CONTROL_MAX_REGS + 2)` = 40 bytes) at your SPI clock,
+    /// divided by the time one poll takes on your CPU, with a wide margin.
     pub transfer_poll_limit: u32,
     /// Max `STATUS0` re-reads waiting for `RESETC` before [`ConfigError::ResetNotComplete`].
     pub reset_poll_limit: u32,
