@@ -64,8 +64,13 @@ stream of minimum-size frames (on the order of ~1700 clock cycles per frame budg
 - The high-priority side is driven by `on_interrupt()` (call it from the chip's IRQ line
   *and* from SPI/DMA transfer-completion) and `on_transmit_ready()` (call it when
   `TransmitSignal::signal()` fires, i.e. the low-prio side queued a frame).
-- Register access goes through `begin_register_read()` / `begin_register_write()` on the
-  high-prio side; pump `on_interrupt()` and collect the result with `take_control_result()`.
+- Register access goes through the high-prio side, in one of two ways:
+  - Blocking: `read_register()` / `write_register()` (and the multi-register
+    `read_registers()` / `write_registers()`) run one control transaction to completion. They
+    never touch the data path, check the write echo, and work before `configure()`. They return
+    `RegisterError::Busy` if a transfer is already in flight.
+  - Non-blocking: `begin_register_read()` / `begin_register_write()` queue the transaction;
+    pump `on_interrupt()` and collect the result with `take_control_result()`.
 
 ---
 
@@ -195,7 +200,8 @@ on a twisted pair (42 to 1514 bytes, single and multi-chunk, three queued frames
   PHY driver applies a rev-B init sequence). Until that is added, don't trust electrical
   behaviour on the wire. Check the datasheet / app note.
 
-See also the project memory note on known-broken paths pinned by `driver_tests`.
+See also the project memory note on known-broken paths pinned by the driver's host tests
+(`src/tc6_driver/tests/`).
 
 ---
 
@@ -206,7 +212,7 @@ See also the project memory note on known-broken paths pinned by `driver_tests`.
 dependencies. It has three parts:
 
 - `src/lib.rs`: board support shared by everything else. Pins/SPI setup, RESET_N / IRQ_N
-  helpers, the `'static` pools and queues (`take_driver()`), pumped register read/write helpers,
+  helpers, the `'static` pools and queues (`take_driver()`), the LAN865x MAC enable,
   and a `raw` module that talks SPI directly, bypassing the driver, for wire-format checks and
   error injection.
 - `src/main.rs` (`cargo run`): hardware-resets the MAC-PHY, configures it, dumps a few
@@ -362,7 +368,12 @@ the minimum-size-frame throughput target, and interop with other stacks (e.g. Li
 
 | Path | What |
 | --- | --- |
-| `src/tc6_driver.rs` | The split driver: `TC6HighPrio`, `TC6LowPrio`, `split*`, `Config`, `smoltcp::phy::Device` impl, `mod driver_tests`. |
+| `src/tc6_driver.rs` | The split driver's root: `TC6HighPrio` / `TC6LowPrio` structs, `split*`, shared types, re-exports. |
+| `src/tc6_driver/data_path.rs` | Data chunks in both directions: `on_interrupt`, `on_transmit_ready`, transmit/receive handling. |
+| `src/tc6_driver/control.rs` | Register access: `begin_register_*` / `take_control_result`, blocking `read_register` family, `RegisterError`. |
+| `src/tc6_driver/bring_up.rs` | `Config`, `configure`, `service_extended_status`. |
+| `src/tc6_driver/device.rs` | `smoltcp::phy::Device` for `TC6LowPrio` and its tokens. |
+| `src/tc6_driver/tests.rs`, `tests/` | Host tests: shared test doubles and setup macros, then one file per area. |
 | `src/tc6_interface.rs` | The `Tc6Interface` transport trait. |
 | `src/embedded_io_implementation.rs` | `EmbeddedHalImplementation` — blocking `Tc6Interface` over `embedded-hal` `SpiDevice`. |
 | `src/tc6_header.rs`, `src/tc6_footer.rs` | TC6 data-chunk header / footer bitfields + parity. |
@@ -370,7 +381,7 @@ the minimum-size-frame throughput target, and interop with other stacks (e.g. Li
 | `src/frame_buffer.rs` | `FrameBuffer<M>` — the `MaybeUninit`-backed frame storage. |
 | `src/bitfield.rs`, `src/fmt.rs` | Bitfield helper macro; logging shim. |
 | `fake_tc6/` | Host-side TC6 device emulator, used as a dev-dependency in tests. |
-| `examples/pico2-bringup/` | Standalone RP2350 firmware: board support (`src/lib.rs`), bring-up demo (`src/main.rs`), on-target test suite (`tests/single_board.rs`). |
+| `examples/pico2-bringup/` | Standalone RP2350 firmware: board support (`src/lib.rs`), bring-up demo (`src/main.rs`), on-target suites (`tests/`). |
 | `OPEN_Alliance_10BASET1x_MAC-PHY_Serial_Interface_V1.1.pdf` | The spec this driver implements. |
 
 ---

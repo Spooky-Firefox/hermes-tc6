@@ -15,9 +15,9 @@ use defmt::{Debug2Format, error, info, warn};
 use defmt_rtt as _;
 use panic_probe as _;
 
+use pico2_bringup as board;
 use pico2_bringup::hermes_tc6::registers::{addr, mms};
 use pico2_bringup::hermes_tc6::tc6_driver::Config;
-use pico2_bringup::{self as board, read_reg};
 use rp235x_hal as hal;
 
 #[hal::entry]
@@ -47,9 +47,9 @@ fn main() -> ! {
         ("STATUS1", mms::STANDARD, addr::STATUS1),
         ("BUFSTS", mms::STANDARD, addr::BUFSTS),
     ] {
-        match read_reg(&mut hi, m, a) {
+        match hi.read_register(m, a) {
             Ok(v) => info!("{=str} = {=u32:#010x}", name, v),
-            Err(e) => warn!("{=str} read failed: {}", name, e),
+            Err(e) => warn!("{=str} read failed: {}", name, Debug2Format(&e)),
         }
     }
     info!("is_configured = {}", hi.is_configured());
@@ -79,13 +79,13 @@ fn main() -> ! {
         let now = ctl.timer.get_counter();
         if (now - last_report).to_millis() >= 1000 {
             last_report = now;
-            let s0 = read_reg(&mut hi, mms::STANDARD, addr::STATUS0);
+            let s0 = hi.read_register(mms::STANDARD, addr::STATUS0);
             info!(
                 "alive: IRQ_N={} irq_loops={} configured={} STATUS0={}",
                 level(ctl.irq_asserted()),
                 irq_count,
                 hi.is_configured(),
-                s0,
+                Debug2Format(&s0),
             );
         }
     }
