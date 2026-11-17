@@ -78,12 +78,26 @@ const CONTROL_BUF_LEN: usize = 4 * (CONTROL_MAX_REGS + 2);
 /// appends/strips it, spec 7.3).
 const ETHERNET_MTU: usize = 1514;
 
-/// Minimum `FrameBuffer` capacity `M` the driver is safe with. A receive frame accumulates up to
-/// a full 1518-byte Ethernet frame (1514 + FCS, in case the MAC is configured to pass it), and
-/// on every chunk the driver hands the MAC a 64-byte payload + 4-byte footer landing zone
-/// *past* the data written so far (`FrameBuffer::get_mut_at_end(68)`). So `M` must cover
-/// `1518 + 64 + 4`, rounded up for headroom.
-const MIN_FRAME_BUFFER_CAPACITY: usize = 1600;
+/// Largest receive frame the buffers are sized for: 1514 + 4-byte FCS (received frames include
+/// it) + 4-byte 802.1Q VLAN tag. A longer frame from the wire is dropped, not a panic (see
+/// `handle_idle`).
+const MAX_RX_FRAME: usize = 1522;
+
+/// Largest start offset of a frame inside the first chunk's payload: `SWO` is 4 bits, counted in
+/// 32-bit words (spec 7.3.7), so `15 * 4`.
+const MAX_RX_START_OFFSET: usize = 60;
+
+/// Bytes the driver hands the MAC-PHY per chunk *past* the frame data received so far
+/// (`FrameBuffer::get_mut_at_end`): 64 payload + 4 footer.
+const RX_CHUNK_WINDOW: usize = 68;
+
+/// Minimum `FrameBuffer` capacity `M` that receives every frame up to [`MAX_RX_FRAME`] bytes.
+///
+/// Worst case: the frame starts at [`MAX_RX_START_OFFSET`] into the buffer, all but its last
+/// byte has arrived, and the last chunk still needs a full [`RX_CHUNK_WINDOW`]:
+/// `60 + (1522 - 1) + 68 = 1649`. (Chunks land 64-byte aligned, so the true worst case is a bit
+/// lower, but this bound needs no alignment argument.) Smaller `M` would drop legal frames.
+const MIN_FRAME_BUFFER_CAPACITY: usize = MAX_RX_START_OFFSET + (MAX_RX_FRAME - 1) + RX_CHUNK_WINDOW;
 
 /// Implemented by the application to wake the high-priority side when the low-priority side has
 /// queued a frame to transmit (e.g. pend a software interrupt, or spawn an RTIC task that ends up

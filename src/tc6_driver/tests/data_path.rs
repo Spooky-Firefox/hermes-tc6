@@ -292,36 +292,122 @@ fn exst_footer_latches_pending_and_still_delivers_the_frame() {
     rx.consume(|b| assert_eq!(b, frame.as_slice()));
 }
 
-/// A footer whose byte offsets are inconsistent (here EV with the end offset before the
-/// start offset) is rejected: the in-progress receive frame is dropped instead of driving an
-/// out-of-range `add_len` that would panic. The driver keeps running.
+/// SV=1 EV=1 with the end before the start on a *fresh* buffer: per spec 7.3.8.1 the EV ends a
+/// frame we no longer hold (dropped earlier) and the SV starts a new one. The old frame's tail
+/// is ignored and the new frame is kept, instead of losing both.
 #[test]
-fn corrupt_footer_offsets_drop_the_frame_without_panic() {
+fn concatenated_chunk_on_fresh_buffer_keeps_the_new_frame() {
     setup!(hi, lo, SpyInterface::default(), NoopSignal);
     hi.sync_established = true;
 
+    let chunk0 = ethernet_like(64);
     hi.handle_idle().unwrap();
-    hi.interface.footer_sync = false;
     hi.interface.respond(
-        &ethernet_like(64),
+        &chunk0,
         crate::tc6_footer::ReceiveFooter::new()
-            .with_sync(true)
             .with_dv(true)
             .with_sv(true)
-            .with_swo(10) // start byte 40
+            .with_swo(10) // new frame starts at byte 40
             .with_ev(true)
-            .with_ebo(3) // end byte 3 - before the start
+            .with_ebo(3) // dropped frame's last byte at 3
+            .with_correct_parity(),
+    );
+    hi.handle_transmit_complete().unwrap();
+    assert!(lo.receive(Instant::ZERO).is_none(), "no frame complete yet");
+
+    let tail: Vec<u8> = (0..20u8).map(|i| 200 + i).collect();
+    hi.handle_idle().unwrap();
+    hi.interface.respond(
+        &tail,
+        crate::tc6_footer::ReceiveFooter::new()
+            .with_dv(true)
+            .with_ev(true)
+            .with_ebo(tail.len() as u8 - 1)
             .with_correct_parity(),
     );
     hi.handle_transmit_complete().unwrap();
 
-    assert!(hi.current_receive_buffer.is_none(), "bad frame dropped");
-    assert!(lo.receive(Instant::ZERO).is_none());
-    assert!(matches!(hi.driver_state, TC6DriverState::Idle));
+    let mut expected = chunk0[40..].to_vec();
+    expected.extend_from_slice(&tail);
+    let (rx, _tx) = lo.receive(Instant::ZERO).expect("new frame delivered");
+    rx.consume(|b| assert_eq!(b, expected.as_slice()));
+}
 
-    // still alive
-    hi.handle_idle().unwrap();
-    assert!(hi.current_receive_buffer.is_some());
+/// Plays the MAC-PHY sending `frame` as receive-only chunks, starting `swo * 4` bytes into the
+/// first chunk's payload.
+fn feed_frame<RxP, TxP, const M: usize, const NQ: usize>(
+    hi: &mut TC6HighPrio<SpyInterface, RxP, TxP, M, NQ>,
+    frame: &[u8],
+    swo: u8,
+) where
+    RxP: BoxPool<Data = FrameBuffer<M>> + 'static,
+    TxP: BoxPool<Data = FrameBuffer<M>> + 'static,
+{
+    let start = swo as usize * 4;
+    let mut sent = 0;
+    while sent < frame.len() {
+        let first = sent == 0;
+        let offset = if first { start } else { 0 };
+        let n = (64 - offset).min(frame.len() - sent);
+        let mut payload = [0u8; 64];
+        payload[offset..offset + n].copy_from_slice(&frame[sent..sent + n]);
+        sent += n;
+        let last = sent == frame.len();
+
+        let mut footer = crate::tc6_footer::ReceiveFooter::new().with_dv(true);
+        if first {
+            footer = footer.with_sv(true).with_swo(swo);
+        }
+        if last {
+            footer = footer.with_ev(true).with_ebo((offset + n - 1) as u8);
+        }
+        hi.handle_idle().unwrap();
+        hi.interface.respond(&payload, footer.with_correct_parity());
+        hi.handle_transmit_complete().unwrap();
+    }
+}
+
+/// The largest frame the buffers are sized for, starting at the largest start offset
+/// (SWO = 15, byte 60), is received whole. With the old 1600-byte minimum the last chunk's
+/// receive window did not fit and `get_mut_at_end` panicked.
+#[test]
+fn max_size_frame_at_max_start_offset_is_received() {
+    setup!(hi, lo, SpyInterface::default(), NoopSignal);
+    hi.sync_established = true;
+
+    for len in [1514, 1518, MAX_RX_FRAME] {
+        let frame = ethernet_like(len);
+        feed_frame(&mut hi, &frame, 15);
+        let (rx, _tx) = lo.receive(Instant::ZERO).expect("frame delivered");
+        rx.consume(|b| assert_eq!(b, frame.as_slice(), "len {len}"));
+    }
+}
+
+/// A frame longer than the FrameBuffer can hold is dropped (no panic), its remaining chunks
+/// are discarded, and the next frame is received normally.
+#[test]
+fn oversize_frame_is_dropped_and_next_frame_received() {
+    setup!(hi, lo, SpyInterface::default(), NoopSignal);
+    hi.sync_established = true;
+
+    feed_frame(&mut hi, &ethernet_like(M + 100), 0);
+    assert!(
+        lo.receive(Instant::ZERO).is_none(),
+        "oversize frame not delivered"
+    );
+
+    let frame = ethernet_like(100);
+    feed_frame(&mut hi, &frame, 0);
+    let (rx, _tx) = lo.receive(Instant::ZERO).expect("next frame delivered");
+    rx.consume(|b| assert_eq!(b, frame.as_slice()));
+    assert!(lo.receive(Instant::ZERO).is_none());
+
+    // no receive buffers leaked: all 8 blocks are back in the pool, or held by the driver
+    let mut held: Vec<Box<RxPool>> = Vec::new();
+    while let Ok(b) = RxPool.alloc(FrameBuffer::new()) {
+        held.push(b);
+    }
+    assert_eq!(held.len() + hi.current_receive_buffer.is_some() as usize, 8);
 }
 
 /// With the receive pool fully drained, `handle_idle` neither panics nor churns the bus when

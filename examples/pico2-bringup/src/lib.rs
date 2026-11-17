@@ -47,8 +47,8 @@ pub const XTAL_FREQ_HZ: u32 = 12_000_000;
 /// Default SPI clock. Low for logic-analyzer-friendly bring-up; the LAN8651 is rated for 25 MHz.
 pub const SPI_HZ: u32 = 1_000_000;
 
-/// Frame buffer capacity (>= the driver's 1600-byte minimum).
-pub const M: usize = 1600;
+/// Frame buffer capacity (>= the driver's 1649-byte minimum, rounded up to a multiple of 64).
+pub const M: usize = 1664;
 /// SPSC queue depth (usable depth NQ - 1).
 pub const NQ: usize = 4;
 /// Frame buffers per pool.

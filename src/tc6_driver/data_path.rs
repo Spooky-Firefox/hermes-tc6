@@ -254,23 +254,30 @@ where
             let f = self.current_receive_buffer.as_ref().unwrap();
             (f.as_slice().is_empty(), f.spare_capacity())
         };
+        // `handle_idle` only hands out a receive window after checking it fits, and the chip
+        // writes at most that window. Anything else means the interface wrote past memory we
+        // own: the heap is already corrupt, so stop here rather than carry on.
+        assert!(
+            spare >= RX_CHUNK_WINDOW,
+            "tc6: receive chunk landed outside the FrameBuffer (spare {} < {})",
+            spare,
+            RX_CHUNK_WINDOW
+        );
 
-        // Reject footer field combinations the framing rules forbid (spec 7.3.7 / 7.3.8.1) or
-        // that would not fit the receive buffer, instead of feeding them to an unchecked
-        // `add_len` / `get_mut_at_end` that would panic. In every case the in-progress frame is
+        // A fresh buffer seeing SV=1 EV=1 with the end at or before the start: the EV belongs
+        // to a frame that was already dropped (e.g. oversize, see `handle_idle`), and the SV
+        // starts a new one in the same chunk (spec 7.3.8.1 concatenation). Keep the new frame.
+        let ev = ev && !(fresh && sv && end <= start);
+
+        // Reject footer field combinations the framing rules forbid (spec 7.3.7 / 7.3.8.1)
+        // instead of feeding them to `add_len`. In every case the in-progress frame is
         // unrecoverable, so drop it and wait for the next SV.
         let bail = if fresh && !sv {
             Some("DV=1 SV=0 on a fresh receive frame (data valid without start)")
-        } else if fresh && ev && end <= start {
-            Some("end-of-frame offset at or before start-of-frame offset")
         } else if !fresh && sv && !ev {
             Some("SV=1 EV=0 mid-frame (repeated frame start)")
         } else if !fresh && sv && ev && footer.ebo() >= footer.swo() * 4 {
             Some("frame concatenation with EBO >= 4*SWO (overlapping frames)")
-        } else if !fresh && sv && spare < 64 {
-            Some("this frame plus the next frame's start would overflow the receive buffer")
-        } else if !fresh && ((ev && end > spare) || (!ev && spare < 64)) {
-            Some("received frame larger than the receive buffer")
         } else {
             None
         };
@@ -356,6 +363,22 @@ where
         // queue (and `transmit()` starts returning None once it fills).
         if !self.sync_established {
             return Ok(());
+        }
+
+        // Every chunk needs a full receive window past the frame data so far. If a frame in
+        // progress has used up the buffer it is longer than `M` allows (only possible for frames
+        // over `MAX_RX_FRAME`, given the `MIN_FRAME_BUFFER_CAPACITY` check in `split`): drop it.
+        // Its remaining chunks then arrive with SV=0 on a fresh buffer and are discarded by
+        // `handle_data_valid` until the next frame starts.
+        if let Some(f) = self.current_receive_buffer.as_ref()
+            && f.spare_capacity() < RX_CHUNK_WINDOW
+        {
+            warn!(
+                "tc6: receive frame longer than the {}-byte FrameBuffer - dropping it",
+                M
+            );
+            self.current_receive_buffer = None;
+            self.extra_start_buffer = None;
         }
 
         // do we have a receive buffer ready to fill? if not allocate one from the pool and queue it up for the tc6 chip to fill
