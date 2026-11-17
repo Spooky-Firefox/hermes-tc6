@@ -22,7 +22,7 @@ use smoltcp::time::Instant;
 use std::collections::BTreeMap;
 use std::vec::Vec;
 
-const M: usize = 1600; // FrameBuffer capacity (bytes); >= MIN_FRAME_BUFFER_CAPACITY
+const M: usize = 1664; // FrameBuffer capacity (bytes); >= MIN_FRAME_BUFFER_CAPACITY (1649)
 const NQ: usize = 4; // spsc queue const param; usable capacity is NQ - 1 == 3
 
 // --------------------------------------------------------------------------------------

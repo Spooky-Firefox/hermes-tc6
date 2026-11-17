@@ -108,8 +108,8 @@ use hermes_tc6::embedded_io_implementation::EmbeddedHalImplementation;
 use hermes_tc6::frame_buffer::FrameBuffer;
 use heapless::{box_pool, spsc::Queue};
 
-// M >= 1600 (MIN_FRAME_BUFFER_CAPACITY); NQ >= 2 (usable depth NQ - 1)
-const M: usize = 1600;
+// M >= 1649 (MIN_FRAME_BUFFER_CAPACITY); NQ >= 2 (usable depth NQ - 1)
+const M: usize = 1664;
 const NQ: usize = 8;
 
 box_pool!(RxP: FrameBuffer<M>);

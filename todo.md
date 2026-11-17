@@ -52,10 +52,6 @@ is next.
 
 ## Correctness / robustness
 
-- [ ] **Guard `FrameBuffer::get_mut_at_end(68)`** in `handle_idle` / `handle_transmit_complete`.
-      With `M >= MIN_FRAME_BUFFER_CAPACITY` (1600) it can't overflow for spec-compliant frames
-      (≤ 1518), but a non-compliant oversized frame from the MAC would panic. Drop the frame
-      instead. (`handle_data_valid`'s `add_len` calls are already guarded via `spare_capacity`.)
 - [ ] **`MaybeUninit` UB on the partial final TX block**: the multi-block path forms a
       `&mut [u8]` over not-yet-written `FrameBuffer` capacity. Benign on real HW/DMA, technically
       UB. Fix: zero `[len, round_up(len, 64))` before the last send, or accept as
@@ -114,6 +110,10 @@ is next.
 - RX-pool-exhaustion no longer panics (`handle_idle` defers; NORX set when a TX frame is
   queued).
 - Receive `FD` (Frame Drop) → buffer freed, frame not surfaced.
+- Receive buffer sizing: `MIN_FRAME_BUFFER_CAPACITY` now counts the SWO start offset
+  (`60 + 1521 + 68 = 1649`; the old 1600 panicked on a max-size frame at a high SWO).
+  `handle_idle` drops frames that outgrow `M` instead of panicking in `get_mut_at_end`; a
+  concatenated SV+EV chunk on a fresh buffer keeps the new frame.
 - `SYNC = 0` in a footer → `sync_established` cleared (host must re-`configure`).
 - `capabilities()`: MTU 1514, `max_burst_size = NQ - 1`, `const` assertions on `M` / `NQ` in
   `split()`.
