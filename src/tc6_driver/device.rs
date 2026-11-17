@@ -65,11 +65,15 @@ where
         // `fresh` is empty with start 0, so this exposes exactly `len` region bytes for `f`.
         frame.add_len(len);
         let r = f(frame.as_mut_slice());
-        frame.write_meta();
 
         // Commit whole 64-byte chunks: the high-prio side always hands the interface a full
-        // chunk window, so the padding past `len` must belong to this record.
-        let used = (META_LEN + len.next_multiple_of(64)) as u16; // <= TX_GRANT
+        // chunk window, so the padding past `len` must belong to this record. The MAC-PHY
+        // ignores bytes past EBO, but zero them anyway so stale bytes from earlier frames in
+        // the ring never go out over SPI.
+        let padded = len.next_multiple_of(64);
+        frame.get_mut_at_index(len, padded - len).fill(0);
+        frame.write_meta();
+        let used = (META_LEN + padded) as u16; // <= TX_GRANT
         frame.into_grant().commit(used);
 
         trace!("tc6: low-prio queued a {}-byte frame for transmit", len);

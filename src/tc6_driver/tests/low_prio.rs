@@ -138,3 +138,26 @@ fn receive_paired_tx_token_also_signals() {
     }
     assert_eq!(lo.transmit_signal.count, 1);
 }
+
+/// The chunk padding committed after a transmit frame is zeroed, so stale ring bytes never
+/// go out over SPI (even though the MAC-PHY ignores everything past EBO).
+#[test]
+fn tx_chunk_padding_is_zeroed() {
+    setup!(hi, lo, SpyInterface::default(), NoopSignal);
+    // dirty the ring where the next grant will land, then abort that grant
+    {
+        let mut g = lo.tx_producer.grant(TX_GRANT as u16).unwrap();
+        g.fill(0xFF);
+    }
+    lo.transmit(Instant::ZERO)
+        .expect("tx token")
+        .consume(10, |b| b.copy_from_slice(&[0xAB; 10]));
+
+    let rec = hi.tx_consumer.read().expect("committed frame");
+    assert_eq!(rec.len(), META_LEN + 64, "padded to one whole chunk");
+    assert_eq!(&rec[META_LEN..META_LEN + 10], &[0xAB; 10]);
+    assert!(
+        rec[META_LEN + 10..].iter().all(|&b| b == 0),
+        "padding must be zeroed"
+    );
+}
