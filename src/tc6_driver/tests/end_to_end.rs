@@ -104,7 +104,7 @@ fn on_interrupt_is_bounded_when_the_footer_always_reports_more_chunks() {
     hi.on_interrupt().expect("returns rather than hanging");
 
     // 64 loop steps alternate issue-chunk / handle-completion -> ~half are chunks.
-    let cap = TC6HighPrio::<AlwaysMoreRx, RxPool, TxPool, M, NQ>::MAX_INTERRUPT_STEPS;
+    let cap = TC6HighPrio::<AlwaysMoreRx, RX_N, TX_N>::MAX_INTERRUPT_STEPS;
     let issued = hi.interface.chunks_issued;
     assert!(
         issued > 0 && issued <= cap,

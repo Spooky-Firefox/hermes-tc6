@@ -3,11 +3,9 @@
 
 use super::*;
 
-impl<T, RxP, TxP, const M: usize, const NQ: usize> TC6HighPrio<T, RxP, TxP, M, NQ>
+impl<'s, T, const RX_N: usize, const TX_N: usize> TC6HighPrio<'s, T, RX_N, TX_N>
 where
     T: Tc6Interface,
-    RxP: BoxPool<Data = FrameBuffer<M>> + 'static,
-    TxP: BoxPool<Data = FrameBuffer<M>> + 'static,
 {
     /// Service the chip. Call this from every interrupt source the chip/interface can raise: the
     /// TC6 chip's own IRQ pin *and* whatever signals SPI/DMA transfer completion (often a separate
@@ -112,12 +110,19 @@ where
             // partway through reassembling a multi-block receive frame
             return true;
         }
-        if self.tx_credits > 0
-            && (self.current_transmit_buffer.is_some() || !self.tx_ready_consumer.is_empty())
+        if self.tx_credits > 0 && (self.current_transmit_buffer.is_some() || self.tx_frame_ready())
         {
             return true;
         }
         false
+    }
+
+    /// Whether the low-prio side has committed a transmit frame that is not yet being sent.
+    /// Only meaningful while `current_transmit_buffer` is `None` (there is one read grant per
+    /// ring, and the in-flight frame holds it). Dropping the peeked grant without `release()`
+    /// keeps the frame in the ring.
+    fn tx_frame_ready(&self) -> bool {
+        self.tx_consumer.read().is_ok()
     }
 
     // This should be called whenever the low-prio side may have queued a frame to transmit:
@@ -135,14 +140,14 @@ where
     pub(super) fn handle_transmit_complete(&mut self) -> Result<(), T::Error> {
         // Copy the 4 footer bytes out of this chunk's MISO region: the 68-byte window past the
         // in-flight receive frame's data, or the scratch buffer for a transmit-only /
-        // rx-pool-exhausted chunk.
+        // rx-ring-full chunk.
         let footer_bytes: [u8; 4] = {
             let region: &mut [u8] = if let Some(receive_frame) =
                 self.current_receive_buffer.as_mut()
             {
-                // Safety: a block send has completed, so the chip has written 64 payload + 4
-                // footer bytes into the 68 bytes past the frame's initialized data.
-                unsafe { receive_frame.get_mut_at_end(68) }
+                // A block send has completed, so the chip has written 64 payload + 4 footer
+                // bytes into the 68 bytes past the frame data so far.
+                receive_frame.get_mut_at_end(68)
             } else if self.current_transmit_buffer.is_some() {
                 &mut self.scratch_buffer
             } else {
@@ -193,7 +198,7 @@ where
             }
 
             self.current_transmit_buffer_cursor += 64;
-            // if we have reached the end of the current transmit buffer drop/free the transmit box
+            // if we have reached the end of the current transmit frame, release its record
             if self.current_transmit_buffer_cursor
                 >= self
                     .current_transmit_buffer
@@ -202,7 +207,8 @@ where
                     .as_slice()
                     .len()
             {
-                self.current_transmit_buffer = None;
+                let frame = self.current_transmit_buffer.take().unwrap();
+                frame.into_grant().release();
                 self.current_transmit_buffer_cursor = 0;
             }
         }
@@ -236,7 +242,7 @@ where
     }
 
     fn handle_data_valid(&mut self, footer: ReceiveFooter) -> Result<(), T::Error> {
-        // If we have no receive buffer we sent NORX = 1 (rx pool exhausted) and the chip should
+        // If we have no receive buffer we sent NORX = 1 (rx ring full) and the chip should
         // have returned DV = 0. A DV = 1 here means a footer bit error slipped past the parity
         // check or the chip is desynced - drop the chunk rather than unwrap a `None`.
         if self.current_receive_buffer.is_none() {
@@ -295,12 +301,12 @@ where
         if fresh {
             // guarded above: SV is set, and when EV is set `start < end <= 64`.
             let receive_frame = self.current_receive_buffer.as_mut().unwrap();
-            unsafe { receive_frame.set_start(start) };
+            receive_frame.set_start(start);
             if ev {
-                unsafe { receive_frame.add_len(end - start) };
+                receive_frame.add_len(end - start);
                 frame_done = true;
             } else {
-                unsafe { receive_frame.add_len(64 - start) };
+                receive_frame.add_len(64 - start);
                 frame_done = false;
             }
         } else {
@@ -309,25 +315,24 @@ where
                 // the start of the next one. Stash the next frame's bytes so the following
                 // receive buffer starts with them. `spare >= 64` was checked above.
                 let receive_frame = self.current_receive_buffer.as_mut().unwrap();
-                let next_start = heapless::Vec::<u8, 64>::from_slice(
-                    &unsafe { receive_frame.get_mut_at_end(64) }[start..],
-                )
-                .unwrap();
+                let next_start =
+                    heapless::Vec::<u8, 64>::from_slice(&receive_frame.get_mut_at_end(64)[start..])
+                        .unwrap();
                 self.extra_start_buffer = Some(next_start);
             }
             let receive_frame = self.current_receive_buffer.as_mut().unwrap();
             if ev {
-                unsafe { receive_frame.add_len(end) };
+                receive_frame.add_len(end);
                 frame_done = true;
             } else {
                 // DV set, EV/SV clear: the whole 64-byte block is frame data.
-                unsafe { receive_frame.add_len(64) };
+                receive_frame.add_len(64);
                 frame_done = false;
             }
         }
 
         if frame_done {
-            let frame = self.current_receive_buffer.take().unwrap();
+            let mut frame = self.current_receive_buffer.take().unwrap();
             // Frame Drop (spec Section 7.3.7): the MAC-PHY sets FD at end-of-frame when the frame
             // must be discarded (e.g. it overflowed the receive buffer). FD is only meaningful
             // with EV = 1, which is exactly the `frame_done` case. Free the buffer instead of
@@ -337,13 +342,17 @@ where
                     "tc6: receive footer FD=1 - dropping this frame ({} bytes)",
                     frame.as_slice().len()
                 );
-                // `frame` drops here, returning its block to the pool
+                // `frame` drops here: an uncommitted grant aborts, giving the space back
             } else {
                 trace!(
                     "tc6: received frame complete ({} bytes), handing to low-prio",
                     frame.as_slice().len()
                 );
-                self.rx_ready_producer.enqueue(frame).unwrap();
+                // Commit just the meta header + region up to the frame end; the rest of the
+                // worst-case grant (and the 68-byte receive window) goes back to the ring.
+                frame.write_meta();
+                let used = frame.record_len() as u16; // <= RX_GRANT, checked in `split`
+                frame.into_grant().commit(used);
             }
         }
         Ok(())
@@ -358,7 +367,7 @@ where
         }
 
         // Until `configure` has driven CONFIG0.SYNC = 1, the MAC-PHY ignores transmit data
-        // chunks and returns DV = 0, so running the data path would just churn the pool and the
+        // chunks and returns DV = 0, so running the data path would just churn the ring and the
         // SPI bus for nothing. Stay idle; frames the low-prio side enqueues wait in the bounded
         // queue (and `transmit()` starts returning None once it fills).
         if !self.sync_established {
@@ -366,25 +375,29 @@ where
         }
 
         // Every chunk needs a full receive window past the frame data so far. If a frame in
-        // progress has used up the buffer it is longer than `M` allows (only possible for frames
-        // over `MAX_RX_FRAME`, given the `MIN_FRAME_BUFFER_CAPACITY` check in `split`): drop it.
+        // progress has used up the grant it is longer than the worst case it was sized for (only
+        // possible for frames over `MAX_RX_FRAME`, see `MIN_FRAME_BUFFER_CAPACITY`): drop it.
         // Its remaining chunks then arrive with SV=0 on a fresh buffer and are discarded by
         // `handle_data_valid` until the next frame starts.
         if let Some(f) = self.current_receive_buffer.as_ref()
             && f.spare_capacity() < RX_CHUNK_WINDOW
         {
             warn!(
-                "tc6: receive frame longer than the {}-byte FrameBuffer - dropping it",
-                M
+                "tc6: receive frame longer than the {}-byte receive grant - dropping it",
+                MIN_FRAME_BUFFER_CAPACITY
             );
             self.current_receive_buffer = None;
             self.extra_start_buffer = None;
         }
 
-        // do we have a receive buffer ready to fill? if not allocate one from the pool and queue it up for the tc6 chip to fill
+        // do we have a receive buffer ready to fill? if not, take a worst-case grant from the
+        // receive ring for the tc6 chip to fill
         if self.current_receive_buffer.is_none() {
-            // TODO make sure the compiler is smart and avoids a hugely expensive copy/move of the FrameBuffer struct here, since it is a large array. It should be optimized away by the compiler, but we should check.
-            self.current_receive_buffer = RxP::alloc(FrameBuffer::new()).ok();
+            self.current_receive_buffer = self
+                .rx_producer
+                .grant(RX_GRANT as u16)
+                .ok()
+                .map(FrameBuffer::fresh);
             match self.current_receive_buffer.as_mut() {
                 Some(buf) => {
                     // A stashed frame start from the previous chunk's tail (see
@@ -394,19 +407,18 @@ where
                     }
                 }
                 None => {
-                    // Pool exhausted: this chunk goes out with NORX = 1 and inbound data is
+                    // Ring full: this chunk goes out with NORX = 1 and inbound data is
                     // dropped. Keep `extra_start_buffer` (if any) so the stashed frame start is
                     // still prepended once a buffer frees up, rather than losing it here.
-                    warn!(
-                        "tc6: rx pool exhausted - sending NORX, dropping inbound data this chunk"
-                    );
+                    warn!("tc6: rx ring full - sending NORX, dropping inbound data this chunk");
                 }
             }
         }
 
         if self.current_transmit_buffer.is_none() {
             // do we have a transmit buffer ready to send? if not, try to get one from the low-prio side
-            self.current_transmit_buffer = self.tx_ready_consumer.dequeue();
+            self.current_transmit_buffer =
+                self.tx_consumer.read().ok().map(FrameBuffer::from_record);
             self.current_transmit_buffer_cursor = 0;
         }
 
@@ -432,26 +444,23 @@ where
                 // also this is the start of data transmission, sv = 1, swo = 0.
                 header = header.with_sv(true);
                 header = header.with_swo(0);
-                // SAFETY: the 64-byte window may run past the frame's initialized bytes (a frame
-                // shorter than one block, e.g. a 42-byte ARP request) into spare capacity, which
-                // is why this is `get_mut_at_index` (bounded by M) rather than
-                // `get_raw_mut_from_index` (bounded by the frame length, which panicked). The
-                // chip ignores bytes past `ebo`.
-                let data = unsafe {
-                    DMAPtr::from_slice(
-                        frame.get_mut_at_index(self.current_transmit_buffer_cursor, 64),
-                    )
-                };
+                // The 64-byte window may run past the frame's bytes (a frame shorter than one
+                // block, e.g. a 42-byte ARP request) into the record's padding: transmit records
+                // are committed as whole 64-byte chunks, so it stays inside the record. The chip
+                // ignores bytes past `ebo`.
+                let data = DMAPtr::from_slice(
+                    frame.get_mut_at_index(self.current_transmit_buffer_cursor, 64),
+                );
 
-                // we can't receive any data due to some reason,(like full receive box pool)
+                // we can't receive any data due to some reason,(like full receive ring)
                 if self.current_receive_buffer.is_none() {
                     header = header.with_norx(true)
                 }
 
                 let result = if let Some(f) = self.current_receive_buffer.as_mut() {
-                    // SAFETY, we are writing to a point which is outside what is considered initialized, and we are not marking this part as initialized,
-                    // that is done when we read the footer returned from the tc6 chip, and then we can determine what is valid and update the length.
-                    unsafe { DMAPtr::from_slice(f.get_mut_at_end(68)) }
+                    // The chip writes past the frame data so far; the footer returned then says
+                    // how much of it is frame data (`add_len` in `handle_data_valid`).
+                    DMAPtr::from_slice(f.get_mut_at_end(68))
                 } else {
                     DMAPtr::from_slice(&mut self.scratch_buffer)
                 };
@@ -482,14 +491,14 @@ where
                 frame.as_mut_slice()[cursor - 4..cursor]
                     .copy_from_slice(&header.raw().to_be_bytes());
 
-                // SAFETY: the window is [cursor-4, cursor+64); on the final (partial) block
-                // its tail runs past the initialized frame data into spare capacity - the
-                // chip ignores those bytes because ebo marks the last valid one.
-                let data = DMAPtr::from_slice(unsafe { frame.get_mut_at_index(cursor - 4, 68) });
+                // The window is [cursor-4, cursor+64); on the final (partial) block its tail
+                // runs past the frame data into the record's chunk padding - the chip ignores
+                // those bytes because ebo marks the last valid one.
+                let data = DMAPtr::from_slice(frame.get_mut_at_index(cursor - 4, 68));
                 let result = if let Some(f) = self.current_receive_buffer.as_mut() {
-                    // SAFETY, we are writing to a point which is outside what is considered initialized, and we are not marking this part as initialized,
-                    // that is done when we read the footer returned from the tc6 chip, and then we can determine what is valid and update the length.
-                    unsafe { DMAPtr::from_slice(f.get_mut_at_end(68)) }
+                    // The chip writes past the frame data so far; the footer returned then says
+                    // how much of it is frame data (`add_len` in `handle_data_valid`).
+                    DMAPtr::from_slice(f.get_mut_at_end(68))
                 } else {
                     DMAPtr::from_slice(&mut self.scratch_buffer)
                 };
@@ -510,17 +519,16 @@ where
             header = header.with_correct_parity();
             self.scratch_buffer[0..4].copy_from_slice(&header.raw().to_be_bytes());
             let data = DMAPtr::from_slice(&mut self.scratch_buffer);
-            // SAFETY, we are writing to a point which is outside what is considered initialized, and we are not marking this part as initialized,
-            // that is done when we read the footer returned from the tc6 chip, and then we can determine what is valid and update the length.
-            let result = unsafe { DMAPtr::from_slice(f.get_mut_at_end(68)) };
+            // The footer returned says how much of this window is frame data.
+            let result = DMAPtr::from_slice(f.get_mut_at_end(68));
             self.interface.begin_send_joined_block(data, result)?;
             self.driver_state = TC6DriverState::WaitingForTransmitComplete;
         } else {
-            // Nothing queued to transmit and the receive pool is exhausted (no buffer to point
+            // Nothing queued to transmit and the receive ring is full (no buffer to point
             // the chip at). Don't churn the bus with NORX polls: the MAC-PHY keeps any pending
             // receive data and holds IRQn asserted, so we retry on the next interrupt or once the
             // low-priority side frees a buffer. Staying `Idle` lets `on_interrupt` break out.
-            trace!("tc6: handle_idle - nothing to transmit and rx pool empty, deferring");
+            trace!("tc6: handle_idle - nothing to transmit and rx ring full, deferring");
         }
         Ok(())
     }

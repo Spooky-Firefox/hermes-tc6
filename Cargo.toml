@@ -29,10 +29,8 @@ fake_tc6 = { path = "fake_tc6" }
 [dependencies]
 embedded-dma = "0.2.0"
 embedded-hal = { version = "1.0.0", optional = true }
-# "pool" (used by tc6_driver) needs portable-atomic on targets without native wide-CAS/arm_llsc;
-# swap for "portable-atomic-unsafe-assume-single-core" if you'd rather not depend on a
-# critical-section impl being registered, but only on genuinely single-core MCUs.
-heapless = { version = "0.9.3", features = ["portable-atomic-critical-section"] }
+# Only `heapless::Vec` is used (receive-path scratch); frame storage is bbqueue.
+heapless = "0.9.3"
 # no default features: the defaults pull in `std` (and `log`), which breaks no_std targets.
 # The driver only needs `phy::Device` + `Medium::Ethernet` (which drags in `socket`, and that
 # requires at least one socket kind, hence `socket-udp`); apps enable the rest themselves.
@@ -40,3 +38,8 @@ smoltcp = { version = "0.13.1", default-features = false, features = ["medium-et
 
 defmt = { version = "1", optional = true }
 log = { version = "0.4", optional = true }
+# Frame rings (bip buffers), one per direction, inside `HermesStorage`. The driver uses the
+# lock-free CAS coordination (`AtomicCoord`), which bbqueue enables on any target with pointer-
+# width CAS (e.g. thumbv7m/thumbv8m). Default features (maitake-sync, critical-section) are not
+# needed. Cortex-M0 (no CAS) would need bbqueue's `critical-section` coordination - not wired up.
+bbqueue = { version = "0.7", default-features = false }

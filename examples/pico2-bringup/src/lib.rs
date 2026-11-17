@@ -18,9 +18,6 @@ use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
 use embedded_hal_bus::spi::ExclusiveDevice;
-use heapless::box_pool;
-use heapless::pool::boxed::{Box, BoxBlock};
-use heapless::spsc::Queue;
 use rp235x_hal::{
     self as hal, Clock,
     fugit::{HertzU32, RateExtU32},
@@ -30,8 +27,9 @@ use rp235x_hal::{
 
 pub use hermes_tc6;
 use hermes_tc6::embedded_io_implementation::EmbeddedHalImplementation;
-use hermes_tc6::frame_buffer::FrameBuffer;
-use hermes_tc6::tc6_driver::{self, RegisterError, TC6HighPrio, TC6LowPrio, TransmitSignal};
+use hermes_tc6::tc6_driver::{
+    self, HermesStorage, RegisterError, TC6HighPrio, TC6LowPrio, TransmitSignal,
+};
 use hermes_tc6::tc6_footer::ReceiveFooter;
 use hermes_tc6::tc6_header::{ControlHeader, TransmitHeader};
 use hermes_tc6::tc6_interface::Tc6Interface;
@@ -47,15 +45,11 @@ pub const XTAL_FREQ_HZ: u32 = 12_000_000;
 /// Default SPI clock. Low for logic-analyzer-friendly bring-up; the LAN8651 is rated for 25 MHz.
 pub const SPI_HZ: u32 = 1_000_000;
 
-/// Frame buffer capacity (>= the driver's 1649-byte minimum, rounded up to a multiple of 64).
-pub const M: usize = 1664;
-/// SPSC queue depth (usable depth NQ - 1).
-pub const NQ: usize = 4;
-/// Frame buffers per pool.
-pub const POOL_BLOCKS: usize = 4;
-
-box_pool!(RxP: FrameBuffer<M>);
-box_pool!(TxP: FrameBuffer<M>);
+/// Receive ring bytes per chip. Holds about 4 full-size frames, or many more small ones (each
+/// frame takes its own length + 6 bytes), on top of the worst-case grant the driver keeps open.
+pub const RX_N: usize = 8192;
+/// Transmit ring bytes per chip (frames are padded to whole 64-byte chunks + 6 bytes).
+pub const TX_N: usize = 8192;
 
 pub type SpiBus = hal::Spi<
     hal::spi::Enabled,
@@ -84,10 +78,10 @@ pub type SpiB = ExclusiveDevice<SpiBusB, CsPinB, Timer>;
 pub type IfaceB = EmbeddedHalImplementation<SpiB>;
 
 /// The high-priority driver half over transport `T`.
-pub type Driver<T> = TC6HighPrio<T, RxP, TxP, M, NQ>;
+pub type Driver<T> = TC6HighPrio<'static, T, RX_N, TX_N>;
 pub type Hi = Driver<Iface>;
 pub type HiB = Driver<IfaceB>;
-pub type Lo = TC6LowPrio<RxP, TxP, FlagSignal, M, NQ>;
+pub type Lo = TC6LowPrio<'static, FlagSignal, RX_N, TX_N>;
 
 /// Run the same early fixups `#[rp235x_hal::entry]` does: release all SIO spinlocks (a probe
 /// reset can leave the critical-section lock held) and enable the coprocessors. Binaries using
@@ -279,49 +273,34 @@ pub fn take_tx_pending_b() -> bool {
     TX_PENDING_B.swap(false, Ordering::Acquire)
 }
 
-/// `'static` storage for one driver instance: adds `POOL_BLOCKS` buffers to each shared pool and
-/// yields that instance's queues. Each expansion owns its statics and can run once per boot.
+/// `'static` frame storage for one driver instance. Each expansion owns its own static and can
+/// run once per boot.
 macro_rules! driver_storage {
     () => {{
-        static mut RX_BLOCKS: [BoxBlock<FrameBuffer<M>>; POOL_BLOCKS] =
-            [const { BoxBlock::new() }; POOL_BLOCKS];
-        static mut TX_BLOCKS: [BoxBlock<FrameBuffer<M>>; POOL_BLOCKS] =
-            [const { BoxBlock::new() }; POOL_BLOCKS];
-        static mut RX_READY: Queue<Box<RxP>, NQ> = Queue::new();
-        static mut TX_READY: Queue<Box<TxP>, NQ> = Queue::new();
+        static mut STORAGE: HermesStorage<RX_N, TX_N> = HermesStorage::new();
         static TAKEN: AtomicBool = AtomicBool::new(false);
 
         assert!(
             !TAKEN.swap(true, Ordering::AcqRel),
             "driver for this chip taken twice in one boot"
         );
-        // SAFETY: guarded by TAKEN, so each static is borrowed exactly once per boot.
-        unsafe {
-            for b in (*(&raw mut RX_BLOCKS)).iter_mut() {
-                RxP.manage(b);
-            }
-            for b in (*(&raw mut TX_BLOCKS)).iter_mut() {
-                TxP.manage(b);
-            }
-            (&mut *(&raw mut RX_READY), &mut *(&raw mut TX_READY))
-        }
+        // SAFETY: guarded by TAKEN, so the static is borrowed exactly once per boot.
+        unsafe { &mut *(&raw mut STORAGE) }
     }};
 }
 
-/// Hand the pools and queues to chip A's driver and return the **unconfigured** pair (run
+/// Hand chip A's frame storage to its driver and return the **unconfigured** pair (run
 /// `hi.configure(..)` next).
 ///
-/// The pools/queues are `'static` singletons, so this works once per boot; a second call
-/// panics. The test harness resets the MCU before every test, so each test may call it.
+/// The storage is a `'static` singleton, so this works once per boot; a second call panics.
+/// The test harness resets the MCU before every test, so each test may call it.
 pub fn take_driver(iface: Iface) -> (Hi, Lo) {
-    let (rx_ready, tx_ready) = driver_storage!();
-    tc6_driver::split::<_, RxP, TxP, _, M, NQ>(iface, rx_ready, tx_ready, FlagSignal(&TX_PENDING))
+    tc6_driver::split(iface, driver_storage!(), FlagSignal(&TX_PENDING))
 }
 
 /// [`take_driver`] for chip B.
 pub fn take_driver_b(iface: IfaceB) -> (HiB, Lo) {
-    let (rx_ready, tx_ready) = driver_storage!();
-    tc6_driver::split::<_, RxP, TxP, _, M, NQ>(iface, rx_ready, tx_ready, FlagSignal(&TX_PENDING_B))
+    tc6_driver::split(iface, driver_storage!(), FlagSignal(&TX_PENDING_B))
 }
 
 /// LAN865x MAC registers (MMS 1). These are Microchip-specific, not part of TC6, and the driver
