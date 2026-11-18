@@ -13,17 +13,16 @@
 //! and internal state-machine fields are reachable from this child module) so a test can
 //! drive one side and observe the other.
 //!
-//! Pool plumbing uses `heapless`'s box pool: <https://docs.rs/heapless/latest/heapless/pool/boxed/index.html>
+//! Frame storage is a stack-local [`HermesStorage`] per test, so tests never share ring state.
 
 use super::*;
-use heapless::pool::boxed::BoxBlock;
 use smoltcp::phy::{Device, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 use std::collections::BTreeMap;
 use std::vec::Vec;
 
-const M: usize = 1664; // FrameBuffer capacity (bytes); >= MIN_FRAME_BUFFER_CAPACITY (1649)
-const NQ: usize = 4; // spsc queue const param; usable capacity is NQ - 1 == 3
+const RX_N: usize = 8192; // receive ring bytes (>= MIN_RX_RING)
+const TX_N: usize = 8192; // transmit ring bytes (>= MIN_TX_RING)
 
 // --------------------------------------------------------------------------------------
 // test doubles
@@ -466,41 +465,21 @@ impl Tc6Interface for RegDouble {
 // environment setup
 // --------------------------------------------------------------------------------------
 
-/// Builds a fresh, isolated driver pair. Every invocation declares its own `box_pool!`
-/// singletons (they are function-local types) and leaks its queues, so tests running in
-/// parallel never share pool state.
+/// Builds a fresh, isolated driver pair over a [`HermesStorage`] local to the calling test.
 macro_rules! setup {
     ($hi:ident, $lo:ident, $i_face:expr, $signal:expr) => {
-        heapless::box_pool!(RxPool: FrameBuffer<M>);
-        heapless::box_pool!(TxPool: FrameBuffer<M>);
-        for _ in 0..8usize {
-            RxPool.manage(::std::boxed::Box::leak(::std::boxed::Box::new(BoxBlock::new())));
-            TxPool.manage(::std::boxed::Box::leak(::std::boxed::Box::new(BoxBlock::new())));
-        }
-        let rx_q: &'static mut Queue<Box<RxPool>, NQ> =
-            ::std::boxed::Box::leak(::std::boxed::Box::new(Queue::new()));
-        let tx_q: &'static mut Queue<Box<TxPool>, NQ> =
-            ::std::boxed::Box::leak(::std::boxed::Box::new(Queue::new()));
+        let mut storage = HermesStorage::<RX_N, TX_N>::new();
         #[allow(unused_mut)]
-        let (mut $hi, mut $lo) = split(($i_face), rx_q, tx_q, ($signal));
+        let (mut $hi, mut $lo) = split(($i_face), &mut storage, ($signal));
     };
 }
 
 /// Like [`setup!`] but goes through [`split_configured`], unwrapping the bring-up result.
 macro_rules! setup_configured {
     ($hi:ident, $lo:ident, $i_face:expr, $signal:expr, $cfg:expr) => {
-        heapless::box_pool!(RxPool: FrameBuffer<M>);
-        heapless::box_pool!(TxPool: FrameBuffer<M>);
-        for _ in 0..8usize {
-            RxPool.manage(::std::boxed::Box::leak(::std::boxed::Box::new(BoxBlock::new())));
-            TxPool.manage(::std::boxed::Box::leak(::std::boxed::Box::new(BoxBlock::new())));
-        }
-        let rx_q: &'static mut Queue<Box<RxPool>, NQ> =
-            ::std::boxed::Box::leak(::std::boxed::Box::new(Queue::new()));
-        let tx_q: &'static mut Queue<Box<TxPool>, NQ> =
-            ::std::boxed::Box::leak(::std::boxed::Box::new(Queue::new()));
+        let mut storage = HermesStorage::<RX_N, TX_N>::new();
         #[allow(unused_mut)]
-        let (mut $hi, mut $lo) = split_configured(($i_face), rx_q, tx_q, ($signal), $cfg)
+        let (mut $hi, mut $lo) = split_configured(($i_face), &mut storage, ($signal), $cfg)
             .expect("bring-up should succeed");
     };
 }
@@ -509,6 +488,30 @@ fn ethernet_like(len: usize) -> Vec<u8> {
     (0..len)
         .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
         .collect()
+}
+
+/// Commits `frame` to the receive ring the way the high-prio side does at end of frame.
+/// Returns `false` if the ring has no room for another worst-case receive grant.
+fn commit_rx_frame<T: Tc6Interface>(hi: &mut TC6HighPrio<'_, T, RX_N, TX_N>, frame: &[u8]) -> bool {
+    let Ok(grant) = hi.rx_producer.grant(RX_GRANT as u16) else {
+        return false;
+    };
+    let mut fb = FrameBuffer::fresh(grant);
+    fb.push_slice(frame);
+    fb.write_meta();
+    let used = fb.record_len() as u16;
+    fb.into_grant().commit(used);
+    true
+}
+
+/// Queues full-MTU frames on the low-prio side until `transmit()` refuses. Returns how many fit.
+fn fill_tx_ring<S: TransmitSignal>(lo: &mut TC6LowPrio<'_, S, RX_N, TX_N>) -> usize {
+    let mut n = 0;
+    while let Some(tok) = lo.transmit(Instant::ZERO) {
+        tok.consume(ETHERNET_MTU, |_| {});
+        n += 1;
+    }
+    n
 }
 
 mod bring_up;

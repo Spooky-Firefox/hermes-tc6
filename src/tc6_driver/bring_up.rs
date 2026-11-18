@@ -175,11 +175,9 @@ pub enum ConfigError<E> {
     Interface(E),
 }
 
-impl<T, RxP, TxP, const M: usize, const NQ: usize> TC6HighPrio<T, RxP, TxP, M, NQ>
+impl<'s, T, const RX_N: usize, const TX_N: usize> TC6HighPrio<'s, T, RX_N, TX_N>
 where
     T: Tc6Interface,
-    RxP: BoxPool<Data = FrameBuffer<M>> + 'static,
-    TxP: BoxPool<Data = FrameBuffer<M>> + 'static,
 {
     // --- blocking bring-up (register configuration, spec Sections 7.6 / 9.2) ---
 

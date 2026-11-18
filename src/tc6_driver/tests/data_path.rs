@@ -335,14 +335,7 @@ fn concatenated_chunk_on_fresh_buffer_keeps_the_new_frame() {
 
 /// Plays the MAC-PHY sending `frame` as receive-only chunks, starting `swo * 4` bytes into the
 /// first chunk's payload.
-fn feed_frame<RxP, TxP, const M: usize, const NQ: usize>(
-    hi: &mut TC6HighPrio<SpyInterface, RxP, TxP, M, NQ>,
-    frame: &[u8],
-    swo: u8,
-) where
-    RxP: BoxPool<Data = FrameBuffer<M>> + 'static,
-    TxP: BoxPool<Data = FrameBuffer<M>> + 'static,
-{
+fn feed_frame(hi: &mut TC6HighPrio<'_, SpyInterface, RX_N, TX_N>, frame: &[u8], swo: u8) {
     let start = swo as usize * 4;
     let mut sent = 0;
     while sent < frame.len() {
@@ -383,14 +376,14 @@ fn max_size_frame_at_max_start_offset_is_received() {
     }
 }
 
-/// A frame longer than the FrameBuffer can hold is dropped (no panic), its remaining chunks
+/// A frame longer than the receive grant can hold is dropped (no panic), its remaining chunks
 /// are discarded, and the next frame is received normally.
 #[test]
 fn oversize_frame_is_dropped_and_next_frame_received() {
     setup!(hi, lo, SpyInterface::default(), NoopSignal);
     hi.sync_established = true;
 
-    feed_frame(&mut hi, &ethernet_like(M + 100), 0);
+    feed_frame(&mut hi, &ethernet_like(MIN_FRAME_BUFFER_CAPACITY + 100), 0);
     assert!(
         lo.receive(Instant::ZERO).is_none(),
         "oversize frame not delivered"
@@ -402,25 +395,27 @@ fn oversize_frame_is_dropped_and_next_frame_received() {
     rx.consume(|b| assert_eq!(b, frame.as_slice()));
     assert!(lo.receive(Instant::ZERO).is_none());
 
-    // no receive buffers leaked: all 8 blocks are back in the pool, or held by the driver
-    let mut held: Vec<Box<RxPool>> = Vec::new();
-    while let Ok(b) = RxPool.alloc(FrameBuffer::new()) {
-        held.push(b);
-    }
-    assert_eq!(held.len() + hi.current_receive_buffer.is_some() as usize, 8);
+    // no receive space leaked: nothing left committed, and once the driver lets go of its
+    // in-progress grant the ring can hand out a worst-case grant again
+    assert!(lo.rx_consumer.read().is_err(), "receive ring is empty");
+    hi.current_receive_buffer = None;
+    assert!(hi.rx_producer.grant(RX_GRANT as u16).is_ok());
 }
 
-/// With the receive pool fully drained, `handle_idle` neither panics nor churns the bus when
+/// With the receive ring full, `handle_idle` neither panics nor churns the bus when
 /// there is nothing to transmit; when a frame *is* queued it still goes out with NORX set.
 #[test]
-fn rx_pool_exhaustion_defers_instead_of_panicking() {
+fn rx_ring_full_defers_instead_of_panicking() {
     setup!(hi, lo, SpyInterface::default(), NoopSignal);
     hi.sync_established = true;
 
-    let mut hog: Vec<Box<RxPool>> = Vec::new();
-    while let Ok(b) = RxPool.alloc(FrameBuffer::new()) {
-        hog.push(b);
+    // fill the receive ring with frames the low-prio side never picks up
+    let frame = ethernet_like(MAX_RX_FRAME);
+    let mut hog = 0;
+    while commit_rx_frame(&mut hi, &frame) {
+        hog += 1;
     }
+    assert!(hog > 0);
 
     // nothing queued + no rx buffer: defer, stay Idle, issue no chunk
     hi.handle_idle().unwrap();
@@ -436,8 +431,6 @@ fn rx_pool_exhaustion_defers_instead_of_panicking() {
     hi.on_transmit_ready().unwrap();
     assert_eq!(hi.interface.chunks.len(), 1);
     assert!(tc6_header::TransmitHeader::from_raw(hi.interface.last().header).norx());
-
-    drop(hog);
 }
 
 #[test]
@@ -867,4 +860,142 @@ fn black_box_round_trip_via_on_interrupt_and_device_receive() {
         lo.receive(Instant::ZERO).is_none(),
         "only the one frame was received"
     );
+}
+
+// --------------------------------------------------------------------------------------
+// frame rings: wrap-around, tailroom, full ring
+// --------------------------------------------------------------------------------------
+
+/// Plays the MAC-PHY for one queued transmit frame: issues chunks until the one with EV,
+/// acknowledging each with a DV = 0 footer, and returns the frame bytes as they went out.
+fn drain_one_tx_frame(hi: &mut TC6HighPrio<'_, SpyInterface, RX_N, TX_N>) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        hi.handle_idle().unwrap();
+        let c = hi.interface.last();
+        let h = tc6_header::TransmitHeader::from_raw(c.header);
+        assert!(h.dv(), "expected a transmit chunk");
+        if h.ev() {
+            out.extend_from_slice(&c.data[..h.ebo() as usize + 1]);
+        } else {
+            out.extend_from_slice(&c.data);
+        }
+        hi.interface
+            .respond(&[], crate::tc6_footer::ReceiveFooter::new());
+        hi.handle_transmit_complete().unwrap();
+        if h.ev() {
+            return out;
+        }
+    }
+}
+
+fn patterned(len: usize, seed: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i.wrapping_mul(13) ^ seed.wrapping_mul(101)) as u8)
+        .collect()
+}
+
+/// The transmit window always spans a full 64-byte chunk, so transmit records are committed
+/// as whole chunks. Lengths around chunk boundaries go out intact, and `get_mut_at_index`'s
+/// bounds check (the record's capacity) never fires.
+#[test]
+fn tx_lengths_around_chunk_boundaries_stay_inside_their_record() {
+    setup!(hi, lo, SpyInterface::default(), NoopSignal);
+    hi.sync_established = true;
+
+    for (seed, len) in [1usize, 63, 64, 65, 127, 128, 129, 1513, 1514]
+        .into_iter()
+        .enumerate()
+    {
+        let frame = patterned(len, seed);
+        lo.transmit(Instant::ZERO)
+            .expect("tx token")
+            .consume(len, |b| b.copy_from_slice(&frame));
+        assert_eq!(drain_one_tx_frame(&mut hi), frame, "len {len}");
+    }
+}
+
+/// Mixed-size transmit frames, several queued at a time, pushed until the ring has wrapped many
+/// times. Every frame arrives intact and in order.
+#[test]
+fn tx_ring_wraps_without_corrupting_or_reordering_frames() {
+    setup!(hi, lo, SpyInterface::default(), NoopSignal);
+    hi.sync_established = true;
+
+    let lens = [60usize, 1514, 342, 64, 900, 65, 1200, 42, 1514, 128];
+    let mut next = 0usize;
+    let mut sent = 0usize;
+    let mut bytes = 0usize;
+    while sent < 300 {
+        // queue up to three frames, as smoltcp would in one poll
+        let mut queued = Vec::new();
+        for _ in 0..3 {
+            let len = lens[next % lens.len()];
+            let Some(tok) = lo.transmit(Instant::ZERO) else {
+                break;
+            };
+            let frame = patterned(len, next);
+            tok.consume(len, |b| b.copy_from_slice(&frame));
+            queued.push(frame);
+            next += 1;
+        }
+        assert!(!queued.is_empty(), "an empty ring always grants");
+        for frame in queued {
+            assert_eq!(drain_one_tx_frame(&mut hi), frame, "frame {sent}");
+            bytes += frame.len();
+            sent += 1;
+        }
+    }
+    assert!(hi.tx_consumer.read().is_err(), "transmit ring drained");
+    assert!(bytes > 20 * TX_N, "ring wrapped many times ({bytes} bytes)");
+}
+
+/// Mixed-size receive frames at varying start offsets, two held by the low-prio side at a
+/// time, until the receive ring has wrapped many times.
+#[test]
+fn rx_ring_wraps_without_corrupting_or_reordering_frames() {
+    setup!(hi, lo, SpyInterface::default(), NoopSignal);
+    hi.sync_established = true;
+
+    let lens = [60usize, 1514, 300, 64, 1522, 65, 1000, 42];
+    let mut bytes = 0usize;
+    for round in 0..120usize {
+        let a = patterned(lens[(2 * round) % lens.len()], 2 * round);
+        let b = patterned(lens[(2 * round + 1) % lens.len()], 2 * round + 1);
+        feed_frame(&mut hi, &a, (round % 16) as u8);
+        feed_frame(&mut hi, &b, ((round * 7) % 16) as u8);
+        for expected in [a, b] {
+            let (rx, _tx) = lo.receive(Instant::ZERO).expect("frame delivered");
+            rx.consume(|got| assert_eq!(got, expected.as_slice(), "round {round}"));
+            bytes += expected.len();
+        }
+    }
+    assert!(lo.receive(Instant::ZERO).is_none());
+    assert!(bytes > 10 * RX_N, "ring wrapped many times ({bytes} bytes)");
+}
+
+/// Once the low-prio side frees space in a full receive ring, the next `handle_idle` gets a
+/// receive grant again and a receive-only chunk goes out (no NORX).
+#[test]
+fn rx_ring_full_recovers_once_low_prio_drains() {
+    setup!(hi, lo, SpyInterface::default(), NoopSignal);
+    hi.sync_established = true;
+
+    let frame = ethernet_like(MAX_RX_FRAME);
+    while commit_rx_frame(&mut hi, &frame) {}
+
+    hi.handle_idle().unwrap();
+    assert!(hi.current_receive_buffer.is_none(), "ring full: no grant");
+    assert!(hi.interface.chunks.is_empty(), "and no bus churn");
+
+    // drain everything the ring held
+    while let Some((rx, _tx)) = lo.receive(Instant::ZERO) {
+        rx.consume(|b| assert_eq!(b, frame.as_slice()));
+    }
+
+    hi.handle_idle().unwrap();
+    assert!(hi.current_receive_buffer.is_some(), "grant available again");
+    let c = hi.interface.last();
+    let h = tc6_header::TransmitHeader::from_raw(c.header);
+    assert!(c.joined && !h.dv() && !h.norx(), "plain receive-only chunk");
 }

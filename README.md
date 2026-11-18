@@ -31,20 +31,22 @@ stream of minimum-size frames (on the order of ~1700 clock cycles per frame budg
 - **Split high-priority / low-priority halves.** `TC6HighPrio` does the fast, time-critical
   SPI servicing; `TC6LowPrio` does the heavy TCP/IP work and implements `smoltcp::phy::Device`.
   The two can live at different RTIC priorities or on different cores.
-- **Lock-free zero-copy hand-off.** `heapless` SPSC queues + box pools move ~1500-byte
-  frame buffers between the two halves with no copy. Separate RX and TX pools avoid
-  deadlock. `MaybeUninit` frame buffers avoid the zeroing cost.
+- **Lock-free zero-copy hand-off.** Frames live in two [`bbqueue`](https://crates.io/crates/bbqueue)
+  framed rings (bip buffers), one per direction, inside a caller-owned `HermesStorage`. The
+  chip DMAs straight into the receive ring, and smoltcp writes straight into the transmit
+  ring, so nothing is copied between the halves. Each frame takes only its own size (a
+  60-byte ARP frame doesn't occupy a full-MTU buffer). Separate RX and TX rings avoid deadlock.
 
 ---
 
 ## Architecture
 
 ```text
-  ┌───────────────────┐   rx_ready SPSC queue    ┌──────────────────┐
-  │   TC6HighPrio     │ ───────(Box<RxP>)──────► │   TC6LowPrio     │
+  ┌───────────────────┐   receive ring (bbqueue) ┌──────────────────┐
+  │   TC6HighPrio     │ ────────(frames)───────► │   TC6LowPrio     │
   │  (IRQ priority)   │                          │  (idle / lower)  │
-  │                   │ ◄──────(Box<TxP>)─────── │                  │
-  │  on_interrupt()   │   tx_ready SPSC queue    │  smoltcp Device  │
+  │                   │ ◄───────(frames)──────── │                  │
+  │  on_interrupt()   │  transmit ring (bbqueue) │  smoltcp Device  │
   │  on_transmit_...  │                          │  (receive/       │
   │  configure()      │        TransmitSignal    │   transmit)      │
   │  begin_register_* │ ◄────────(wake)───────── │                  │
@@ -59,8 +61,9 @@ stream of minimum-size frames (on the order of ~1700 clock cycles per frame budg
    10BASE-T1S MAC-PHY  ── single pair ──  multidrop bus
 ```
 
-- `split()` / `split_configured()` consume a `Tc6Interface`, `'static` queue storage, and a
-  `TransmitSignal`, and return the `(TC6HighPrio, TC6LowPrio)` pair.
+- `split()` / `split_configured()` take a `Tc6Interface`, a `&'s mut HermesStorage` and a
+  `TransmitSignal`, and return the `(TC6HighPrio<'s, ..>, TC6LowPrio<'s, ..>)` pair. The halves
+  borrow the storage for `'s`.
 - The high-priority side is driven by `on_interrupt()` (call it from the chip's IRQ line
   *and* from SPI/DMA transfer-completion) and `on_transmit_ready()` (call it when
   `TransmitSignal::signal()` fires, i.e. the low-prio side queued a frame).
@@ -99,23 +102,19 @@ merges the features.
 
 ## Usage sketch
 
-The box pool types must name a concrete `FrameBuffer<M>`, so the application declares the
-pools and the `'static` queue storage; the generic driver takes them as parameters.
+All frame memory is one `HermesStorage<RX_N, TX_N>`: a receive ring of `RX_N` bytes and a
+transmit ring of `TX_N` bytes. It is big, so give it a `static` home (RTIC
+`#[init(local = [...])]`, `StaticCell`, or a `static mut` behind a taken flag), not the stack.
 
 ```rust
-use hermes_tc6::tc6_driver::{self, Config, TransmitSignal};
+use hermes_tc6::tc6_driver::{self, Config, HermesStorage, TransmitSignal};
 use hermes_tc6::embedded_io_implementation::EmbeddedHalImplementation;
-use hermes_tc6::frame_buffer::FrameBuffer;
-use heapless::{box_pool, spsc::Queue};
 
-// M >= 1649 (MIN_FRAME_BUFFER_CAPACITY); NQ >= 2 (usable depth NQ - 1)
-const M: usize = 1664;
-const NQ: usize = 8;
+// RX_N >= MIN_RX_RING (3311), TX_N >= MIN_TX_RING (3085); checked at compile time
+const RX_N: usize = 8192;
+const TX_N: usize = 8192;
 
-box_pool!(RxP: FrameBuffer<M>);
-box_pool!(TxP: FrameBuffer<M>);
-
-// ... in #[init]: `manage` backing memory for RxP / TxP, get `&'static mut Queue`s ...
+// ... in #[init]: get a `storage: &'static mut HermesStorage<RX_N, TX_N>` ...
 
 struct Signal; // pend the high-prio task / software IRQ
 impl TransmitSignal for Signal {
@@ -123,13 +122,37 @@ impl TransmitSignal for Signal {
 }
 
 let iface = EmbeddedHalImplementation::new(spi_device); // spi_device: embedded-hal SpiDevice, mode 0
-let (mut hi, mut lo) = tc6_driver::split_configured::<_, RxP, TxP, _, M, NQ>(
-    iface, rx_ready, tx_ready, Signal, &Config::default(),
-)?;
+let (mut hi, mut lo) = tc6_driver::split_configured(iface, storage, Signal, &Config::default())?;
 
 // high-prio context:  hi.on_interrupt()?  /  hi.on_transmit_ready()?
 // low-prio context:   run smoltcp against `lo` (impl smoltcp::phy::Device)
 ```
+
+### Sizing the rings
+
+Each frame takes its length + 6 bytes (bbqueue's 2-byte length + a 4-byte `{start, len}`
+header) in the ring. Transmit frames are also padded to whole 64-byte chunks, because the SPI
+windows always span a full chunk. Each side keeps one worst-case grant open while it works: the
+receive side always holds 1655 bytes for the frame it is receiving, and a smoltcp tx token holds
+1542 until it is consumed.
+
+- `MIN_RX_RING` / `MIN_TX_RING` are two worst-case records plus one byte. A bip buffer only
+  hands out contiguous space and bbqueue doesn't rewind an empty ring, so anything smaller can
+  get stuck with no gap big enough on either side.
+- `max_burst_size` reports how many full-size frames the transmit ring is guaranteed to take
+  (`(TX_N - 1) / 1542 - 1`, so 4 for 8 KiB). Small frames pack far denser: about 95 60-byte
+  frames fit in 8 KiB.
+- When the receive ring is full the driver sends chunks with `NORX` and the MAC-PHY keeps the
+  data until the low-prio side frees space. When the transmit ring is full `transmit()` /
+  `receive()` return `None`.
+
+### Targets
+
+The rings use bbqueue's lock-free CAS coordination, so the target needs pointer-width
+compare-and-swap (Cortex-M3 and up, e.g. `thumbv7m`, `thumbv7em`, `thumbv8m`). Cortex-M0/M0+
+(`thumbv6m`) is not supported yet: bbqueue 0.7's `portable-atomic` features don't reach its
+CAS coordination, so M0 would need bbqueue's critical-section coordination (`CsCoord`) selected
+in place of `AtomicCoord`.
 
 ### SPI bus requirements
 
@@ -212,7 +235,7 @@ See also the project memory note on known-broken paths pinned by the driver's ho
 dependencies. It has three parts:
 
 - `src/lib.rs`: board support shared by everything else. Pins/SPI setup, RESET_N / IRQ_N
-  helpers, the `'static` pools and queues (`take_driver()`), the LAN865x MAC enable,
+  helpers, the `'static` frame storage (`take_driver()`), the LAN865x MAC enable,
   and a `raw` module that talks SPI directly, bypassing the driver, for wire-format checks and
   error injection.
 - `src/main.rs` (`cargo run`): hardware-resets the MAC-PHY, configures it, dumps a few
@@ -261,7 +284,7 @@ bring-up.
 `tests/single_board.rs` uses [embedded-test](https://github.com/probe-rs/embedded-test).
 probe-rs resets the MCU before every test, and the suite's `#[init]` pulses RESET_N, so every
 test starts with a fresh MCU *and* a freshly reset MAC-PHY. This is why each test can call
-`take_driver()`: the `'static` pools/queues can only be handed out once per boot. Logs go over
+`take_driver()`: each chip's `'static` `HermesStorage` can only be handed out once per boot. Logs go over
 defmt-rtt. Semihosting is only used for test selection and pass/fail.
 
 Results of the first run (2026-11-03, all 18 pass):
@@ -339,7 +362,7 @@ No peer node is needed for any of these. Ticked items are covered by `tests/sing
       loopback (check the LAN8650/1 datasheet for which the part supports). Then send frames of
       60, 64, 65, 127, 128 and 1514 bytes, plus back-to-back bursts, and check length and
       payload on the receive side. This covers the single- and multi-block TX/RX paths, footer
-      `TXC`/`RCA` accounting and pool-exhaustion recovery on real silicon, which `fake_tc6`
+      `TXC`/`RCA` accounting and full-ring recovery on real silicon, which `fake_tc6`
       can't confirm independently.
 - [ ] **TX into an open line** (no loopback): frames should leave the MAC (CSMA/CD, no PLCA).
       Check that TX credits recover, there is no `TXBOE`, and the MAC statistics counters
@@ -378,7 +401,7 @@ the minimum-size-frame throughput target, and interop with other stacks (e.g. Li
 | `src/embedded_io_implementation.rs` | `EmbeddedHalImplementation` — blocking `Tc6Interface` over `embedded-hal` `SpiDevice`. |
 | `src/tc6_header.rs`, `src/tc6_footer.rs` | TC6 data-chunk header / footer bitfields + parity. |
 | `src/registers.rs` | Register map (standard MMS + a best-effort PLCA block). |
-| `src/frame_buffer.rs` | `FrameBuffer<M>` — the `MaybeUninit`-backed frame storage. |
+| `src/frame_buffer.rs` | `FrameBuffer<B>` — a frame view over one ring record (the `{start, len}` meta header + frame region). |
 | `src/bitfield.rs`, `src/fmt.rs` | Bitfield helper macro; logging shim. |
 | `fake_tc6/` | Host-side TC6 device emulator, used as a dev-dependency in tests. |
 | `examples/pico2-bringup/` | Standalone RP2350 firmware: board support (`src/lib.rs`), bring-up demo (`src/main.rs`), on-target suites (`tests/`). |
@@ -404,7 +427,7 @@ cargo build --target thumbv8m.main-none-eabihf   # check the lib still builds no
 
 Part of a 10BASE-T1S project: T1S PCBs, this driver, and the `fake_tc6` emulator, groundwork
 for a transport-agnostic secure bootloader over a multidrop bus. Built on `smoltcp`,
-`heapless`, `embedded-hal`, `embedded-dma`.
+`bbqueue`, `heapless`, `embedded-hal`, `embedded-dma`.
 
 ## License
 

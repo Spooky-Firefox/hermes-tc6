@@ -277,7 +277,7 @@ mod tests {
         a_to_b(l, &[42]);
     }
 
-    /// Three frames queued before the driver runs (the queue holds `NQ - 1` = 3): each must
+    /// Three frames queued before the driver runs (the 8 KiB transmit ring fits them): each must
     /// arrive once, in order, with no re-sends.
     #[test]
     #[timeout(10)]
